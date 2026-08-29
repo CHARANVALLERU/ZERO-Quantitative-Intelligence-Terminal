@@ -9,7 +9,7 @@ streamlit
 plotly
 Pillow                 # AGI vision / screenshot paths (PIL)
 mss                    # multi-monitor screen capture fallback (ui/components.py)
-streamlit-autorefresh  # live-feed auto-refresh (optional; UI degrades without)
+streamlit-autorefresh  # live-feed auto-refresh
 
 # ── Live data ingestion ──────────────────────────────────────────────
 yfinance
@@ -21,16 +21,16 @@ pytz
 
 # ── Persistence ──────────────────────────────────────────────────────
 # db/ uses stdlib sqlite3; SQLAlchemy is unused by app code today but kept
-# for tooling / future ORM. pyarrow is optional (parquet feature-store).
+# for tooling / future ORM.
 SQLAlchemy
-pyarrow                # feature-store parquet (optional; degrades gracefully)
+pyarrow                # feature-store parquet
 
-# ── Optional ML accelerators ─────────────────────────────────────────
+# ── ML accelerators (required) ───────────────────────────────────────
 # Calibrator uses pure-numpy ridge; xgboost is auto-detected when present.
-# scikit-learn / joblib are not imported by ZERO today (safe extras / ecosystem).
+# scikit-learn / joblib ship with the standard install.
 scikit-learn
 xgboost
-scipy                  # advanced_backtest stats helpers (lazy; optional)
+scipy                  # advanced_backtest stats helpers
 joblib
 
 # ── ZERO ENGINE — Gemini AI ──────────────────────────────────────────
@@ -43,13 +43,29 @@ google-generativeai>=0.7.0
 youtube-transcript-api>=1.2.4
 yt-dlp
 
-# ── Optional: Volatility & TSFM ensemble legs ───────────────────────
-# All optional — the engine degrades gracefully (EWMA / no-op) without them.
+# ── Aegis-Quant — offline financial RAG (required) ───────────────────
+# OKFFinancialRAG prefers langchain-huggingface + langchain-chroma, then
+# falls back to langchain-community. Document + persist still need
+# langchain-core / chromadb / sentence-transformers.
+# Warm the MiniLM cache once after install (do not run on every launch):
+#   python scripts/warmup_okf_embeddings.py
+# Then set HF_HUB_OFFLINE=1 and/or ZERO_OKF_OFFLINE=1 (see .env.example).
+langchain-huggingface
+langchain-chroma
+langchain-community
+langchain-core
+chromadb
+sentence-transformers
+
+# ── Heavy TSFM / GARCH backends (not installed by default) ──────────
+# Large PyPI stacks — install via README "Optional power-ups" if you want
+# those legs live. The engine degrades to EWMA / no-op without them.
+# These are NOT native-terminal extras (only MetaTrader5 is).
 # arch                     # EGARCH/GJR-GARCH (engine/volatility_forecast.py)
 # chronos-forecasting      # Chronos-2 TSFM leg (engine/tsfm_predictor.py; pulls torch)
 # timesfm[torch]           # TimesFM 2.5 leg (heavy; often hard on bleeding-edge Python)
 
-# ── Optional: KRONOS ENGINE — K-line foundation model (vendored) ────
+# ── KRONOS ENGINE — K-line foundation model (vendored) ──────────────
 # Kronos is VENDORED at engine/kronos/ — no repo clone or KRONOS_REPO_PATH
 # needed. Without torch the KRONOS ENGINE tab sits in OFFLINE/STANDBY and
 # the rest of the terminal degrades gracefully.
@@ -65,7 +81,7 @@ huggingface_hub            # pulls NeoQuasar/Kronos-* weights on first LOAD MODE
 safetensors                # safe/fast checkpoint loading
 tqdm                       # progress bars (weight download / finetune loops)
 pyyaml                     # finetune configs (engine/kronos_finetune/configs/)
-# accelerate               # optional HF/Chronos ecosystem; not required by vendored Kronos
+# accelerate               # HF/Chronos ecosystem; not required by vendored Kronos
 
 # ── ZERO AITE — Automated Intelligent Trading Environment ───────────
 # Daemon (`python -m engine.aite.daemon`) and generation runner
@@ -76,8 +92,10 @@ pyyaml                     # finetune configs (engine/kronos_finetune/configs/)
 # Streamlit UI tab also uses plotly (already listed). The 3D bot graph is
 # custom canvas JS in ui/aite/graph_3d.py — no three.js / npm package
 # (nothing to pip-install; no CDN three.js dependency).
-#
-# Optional MT5 paper path (Windows + MetaTrader 5 terminal required).
-# Lazy-imported in engine/aite/mt5_adapter.py — AITE runs on local paper
+
+# ── Optional extras (native terminals / broker SDKs only) ────────────
+# ONLY packages that bind to installed desktop software belong here.
+# All other PyPI libraries above are required.
+# Lazy-imported in engine/aite/mt5_adapter.py — AITE stays on local paper
 # sim without it. Enable with ZERO_AITE_MT5=1 (see .env.example).
-# MetaTrader5            # pip install MetaTrader5  (optional; Windows)
+# MetaTrader5            # pip install MetaTrader5  (Windows + MT5 terminal)

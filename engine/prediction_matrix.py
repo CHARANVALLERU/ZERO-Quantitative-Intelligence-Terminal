@@ -538,6 +538,7 @@ def _generate_single_index_prediction(index_name, us_summary, gift_price, adr_da
             news_items=news_items,
             sentiment_data=sentiment_data,
             option_chain=options_data,
+            query=index_name,
         )
     except Exception:
         res['agent_debate'] = None

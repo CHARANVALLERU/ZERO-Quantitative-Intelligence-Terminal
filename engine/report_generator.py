@@ -25,6 +25,8 @@ Public API
   path written (idempotent same-day overwrite).
 * ``memo_from_latest(matrix=None, debate=None)`` -> generate + write for
   today, returns the vault path.
+* ``okf_memo_query(matrix)`` -> retrieval query for the IC OKF chip.
+* ``okf_citation_block(query=None, k=3)`` -> small markdown citation chip.
 """
 
 from __future__ import annotations
@@ -90,11 +92,19 @@ DISCLAIMER_TEXT: str = (
     'information contained herein.'
 )
 
+DEFAULT_OKF_QUERY: str = os.environ.get(
+    'ZERO_MEMO_OKF_QUERY', 'NIFTY earnings macro'
+)
+"""Fallback local-OKF retrieval query for the IC citation chip."""
+
 __all__ = [
     'DEFAULT_VAULT_DIR',
+    'DEFAULT_OKF_QUERY',
     'generate_daily_memo',
     'write_memo_to_vault',
     'memo_from_latest',
+    'okf_memo_query',
+    'okf_citation_block',
 ]
 
 # ---------------------------------------------------------------------------
@@ -561,6 +571,60 @@ def _build_footer() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Local OKF citation (lazy import — fail-soft if RAG deps are missing)
+# ---------------------------------------------------------------------------
+
+
+def okf_memo_query(matrix: dict | None = None) -> str:
+    """Retrieval query from the memo's lead index, else ``NIFTY earnings macro``."""
+    indices = list(_iter_indices(_as_dict(matrix)))
+    if indices:
+        return f'{indices[0][0]} earnings macro'
+    return DEFAULT_OKF_QUERY
+
+
+def okf_citation_block(query: str | None = None, k: int = 3) -> str:
+    """Small markdown citation chip for the IC memo / TRADING TERMINAL card.
+
+    Empty store or missing RAG deps → ``No local OKF hits`` body so the
+    chip stays visible and matches the UI caption.
+    """
+    q = str(query or '').strip() or DEFAULT_OKF_QUERY
+    try:
+        from engine.okf_context import get_okf_hits
+        hits = get_okf_hits(q, k=k)
+    except Exception as exc:
+        logger.warning('OKF citation retrieval failed: %s', exc)
+        hits = ''
+    if not hits:
+        return (
+            '## Local OKF Evidence\n\n'
+            f'*query:* `{q}`\n\n'
+            '*No local OKF hits.*'
+        )
+    preview = hits if len(hits) <= 1200 else hits[:1200].rstrip() + '…'
+    return (
+        f'## Local OKF Evidence\n\n'
+        f'*query:* `{q}`\n\n'
+        f'```text\n{preview}\n```'
+    )
+
+
+def _okf_ingest_memo(title: str, markdown: str) -> None:
+    """Index the daily IC memo into the local OKF store. Never raises."""
+    body = str(markdown or '').strip()
+    if not body:
+        return
+    try:
+        from engine.okf_context import ingest_okf
+        ingest_okf(title, body, 'IC_Memo')
+    except RuntimeError as exc:
+        logger.warning('OKF IC memo ingest skipped (RAG unavailable): %s', exc)
+    except Exception as exc:
+        logger.warning('OKF IC memo ingest failed: %s', exc)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -612,10 +676,16 @@ def generate_daily_memo(
     if isinstance(debate, dict) and debate:
         sections.append(_build_debate_verdict(debate))
     sections.append(_build_risk_section(indices))
+    # Retrieve local OKF hits *before* ingesting this memo so the chip
+    # reflects prior evidence (news / filings), not the memo itself.
+    okf_query = okf_memo_query(matrix)
+    sections.append(okf_citation_block(okf_query))
     sections.append(f'## Disclaimer\n\n{DISCLAIMER_TEXT}')
     sections.append(_build_footer())
 
-    return '\n\n'.join(section.strip('\n') for section in sections if section) + '\n'
+    markdown = '\n\n'.join(section.strip('\n') for section in sections if section) + '\n'
+    _okf_ingest_memo(f'ZERO Daily IC Memo {trade_date}', markdown)
+    return markdown
 
 
 def write_memo_to_vault(

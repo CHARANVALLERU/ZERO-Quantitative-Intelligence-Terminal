@@ -38,7 +38,8 @@ from engine.learning_service import (
     update_feedback_logs,
     update_unfulfilled_feedback_logs,
     log_daily_feedback,
-    auto_train_engine
+    auto_train_engine,
+    run_nightly_self_reflection,
 )
 from engine.prediction_ranges import get_range_config
 
@@ -141,6 +142,22 @@ def run_daily_update():
             logger.info("  No training result returned.")
     except Exception as e:
         logger.error(f"Auto-train failed: {e}")
+
+    # Step 5c: Nightly actuals → self-reflection (per-index, action-gated)
+    logger.info("Step 5c: Running self-learning reflection on realized actuals...")
+    try:
+        reflection = run_nightly_self_reflection()
+        logger.info(f"  Reflection status: {reflection.get('status', 'unknown')}")
+        if reflection.get("reason"):
+            logger.info(f"  Reason: {reflection.get('reason')}")
+        for row in reflection.get("reflections") or []:
+            logger.info(
+                f"  {row.get('index')}: {row.get('status')} "
+                f"date={row.get('date')} mutated={row.get('mutated')} "
+                f"reason={row.get('reason')}"
+            )
+    except Exception as e:
+        logger.error(f"Self-learning reflection failed (fail-soft): {e}")
 
     # Step 5b: Retrain the adaptive calibration layer on the updated log
     logger.info("Step 5b: Retraining adaptive calibration layer...")

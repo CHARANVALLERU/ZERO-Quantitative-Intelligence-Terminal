@@ -137,6 +137,7 @@ def log_daily_feedback(prediction_data, actual_data=None, reason="", target_date
                     "pred_open": idx_pred_data.get('pred_open', 0),
                     "pred_high": idx_pred_data.get('pred_high', 0),
                     "pred_low": idx_pred_data.get('pred_low', 0),
+                    "pred_close": idx_pred_data.get('pred_close', 0),
                 }
                 raw_inputs = idx_pred_data
             else:
@@ -146,6 +147,7 @@ def log_daily_feedback(prediction_data, actual_data=None, reason="", target_date
                     "pred_open": round(prediction_data.get('pred_open', 0) * mult, 2),
                     "pred_high": round(prediction_data.get('pred_high', 0) * mult, 2),
                     "pred_low": round(prediction_data.get('pred_low', 0) * mult, 2),
+                    "pred_close": round(prediction_data.get('pred_close', 0) * mult, 2),
                 }
                 raw_inputs = prediction_data
             
@@ -434,3 +436,341 @@ def auto_train_engine(current_matrix):
         return {"status": "holding", "results": calc if calc else "Insufficient data"}
     
     return {"status": "failed", "results": "No actuals fetched. Data might not be settled."}
+
+
+# ── Decision-log join + nightly self-reflection (items 4 / 12) ─────────────
+
+_ACTION_FLAT_THRESHOLD = 0.002  # 20 bps session return → FLAT (HOLD is correct)
+_learner_singleton = None
+_learner_failed = False
+
+
+def _finite_number(value):
+    try:
+        if value is None or value == "" or value == "N/A":
+            return None
+        number = float(value)
+        if number != number:  # NaN
+            return None
+        return number
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_debate_action(action) -> str:
+    mapped = str(action or "").upper().strip()
+    if mapped in ("LONG", "BUY", "BULLISH", "STRONG BULLISH"):
+        return "BUY"
+    if mapped in ("SHORT", "SELL", "BEARISH", "STRONG BEARISH"):
+        return "SELL"
+    return "HOLD"
+
+
+def _realized_session_direction(actual) -> str | None:
+    """UP / DOWN / FLAT from realized OHLC, or None if actuals are missing."""
+    if not isinstance(actual, dict):
+        return None
+    close = _finite_number(actual.get("close"))
+    open_px = _finite_number(actual.get("open"))
+    if close is None or open_px is None or abs(open_px) < 1e-12:
+        return None
+    ret = (close - open_px) / abs(open_px)
+    if abs(ret) < _ACTION_FLAT_THRESHOLD:
+        return "FLAT"
+    return "UP" if ret > 0 else "DOWN"
+
+
+def score_debate_action(action, actual) -> dict:
+    """Score HOLD vs BUY vs SELL against realized OHLC. Never mutates weights."""
+    direction = _realized_session_direction(actual)
+    mapped = _normalize_debate_action(action)
+    if direction is None:
+        return {
+            "scored": False,
+            "action": mapped,
+            "realized": None,
+            "action_wrong": None,
+            "reason": "actuals_missing",
+        }
+    if mapped == "BUY":
+        wrong = direction != "UP"
+    elif mapped == "SELL":
+        wrong = direction != "DOWN"
+    else:
+        wrong = direction != "FLAT"
+    return {
+        "scored": True,
+        "action": mapped,
+        "realized": direction,
+        "action_wrong": bool(wrong),
+        "reason": "action_miss" if wrong else "action_hit",
+    }
+
+
+def _canon_index(name) -> str | None:
+    try:
+        from core.self_learning_agent import normalize_index_name, TRACKED_INDICES
+
+        key = normalize_index_name(name)
+        if key in TRACKED_INDICES:
+            return key
+    except Exception:
+        pass
+    raw = str(name or "").strip().upper()
+    aliases = {
+        "NIFTY": "NIFTY",
+        "NIFTY 50": "NIFTY",
+        "NIFTY50": "NIFTY",
+        "BANKNIFTY": "BANKNIFTY",
+        "BANK NIFTY": "BANKNIFTY",
+        "SENSEX": "SENSEX",
+    }
+    return aliases.get(raw)
+
+
+def _entry_date(value) -> str | None:
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return None
+
+
+def _actual_lookup():
+    """(date, canon_index) -> feedback log entry with a usable actual close."""
+    lookup = {}
+    for entry in get_feedback_logs() or []:
+        if not isinstance(entry, dict):
+            continue
+        date = _entry_date(entry.get("date"))
+        key = _canon_index(entry.get("index"))
+        if not date or not key:
+            continue
+        actual = entry.get("actual")
+        if _realized_session_direction(actual) is None:
+            continue
+        lookup[(date, key)] = entry
+    return lookup
+
+
+def score_logged_decisions() -> dict:
+    """
+    Join agent_decisions.jsonl against feedback-log actuals.
+    Decisions without realized OHLC stay pending and are not scored.
+    """
+    try:
+        from engine.agent_debate import load_decision_log
+        decisions = load_decision_log()
+    except Exception:
+        decisions = []
+
+    lookup = _actual_lookup()
+    by_action = {"BUY": {"hits": 0, "misses": 0}, "SELL": {"hits": 0, "misses": 0}, "HOLD": {"hits": 0, "misses": 0}}
+    scored_rows = []
+    pending = 0
+
+    for entry in decisions:
+        if not isinstance(entry, dict):
+            continue
+        date = _entry_date(entry.get("ts") or entry.get("date"))
+        key = _canon_index(entry.get("index"))
+        verdict = entry.get("verdict") if isinstance(entry.get("verdict"), dict) else {}
+        action = verdict.get("action")
+        if not date or not key:
+            pending += 1
+            continue
+        fb = lookup.get((date, key))
+        if not fb:
+            pending += 1
+            continue
+        result = score_debate_action(action, fb.get("actual"))
+        if not result.get("scored"):
+            pending += 1
+            continue
+        mapped = result["action"]
+        if result["action_wrong"]:
+            by_action[mapped]["misses"] += 1
+        else:
+            by_action[mapped]["hits"] += 1
+        scored_rows.append({
+            "date": date,
+            "index": key,
+            "action": mapped,
+            "realized": result["realized"],
+            "action_wrong": result["action_wrong"],
+        })
+
+    hits = sum(v["hits"] for v in by_action.values())
+    misses = sum(v["misses"] for v in by_action.values())
+    return {
+        "status": "scored" if (hits + misses) else "needs_actuals_join",
+        "logged_decisions": len(decisions),
+        "scored": hits + misses,
+        "pending_actuals": pending,
+        "hits": hits,
+        "misses": misses,
+        "by_action": by_action,
+        "rows": scored_rows[-30:],
+        "note": (
+            "Prompt mutation is gated on action_wrong, not point-forecast error. "
+            "Pending rows wait for realized OHLC."
+        ),
+    }
+
+
+def _get_reflection_learner():
+    global _learner_singleton, _learner_failed
+    if _learner_failed:
+        return None
+    if _learner_singleton is not None:
+        return _learner_singleton
+    try:
+        from core.self_learning_agent import SelfLearningQuantAgent
+
+        _learner_singleton = SelfLearningQuantAgent()
+        return _learner_singleton
+    except Exception as exc:
+        print(f"Self-learning agent unavailable for nightly reflection: {exc}")
+        _learner_failed = True
+        return None
+
+
+def _pred_close_for(entry, decision=None):
+    predicted = entry.get("predicted") if isinstance(entry, dict) else {}
+    close = _finite_number((predicted or {}).get("pred_close"))
+    if close is not None and close > 0:
+        return close
+    raw = entry.get("raw_inputs") if isinstance(entry, dict) else {}
+    close = _finite_number((raw or {}).get("pred_close"))
+    if close is not None and close > 0:
+        return close
+    if isinstance(decision, dict):
+        snap = decision.get("prediction_snapshot") or {}
+        close = _finite_number(snap.get("pred_close"))
+        if close is not None and close > 0:
+            return close
+    return None
+
+
+def _latest_decision_for(decisions, date, index_key):
+    match = None
+    for entry in decisions:
+        if not isinstance(entry, dict):
+            continue
+        if _entry_date(entry.get("ts") or entry.get("date")) != date:
+            continue
+        if _canon_index(entry.get("index")) != index_key:
+            continue
+        match = entry
+    return match
+
+
+def run_nightly_self_reflection() -> dict:
+    """
+    After realized OHLC are known, reflect per index.
+
+    - Missing actuals → skip (do not touch weights).
+    - Debate ACTION correct → record variance, do not mutate the prompt.
+    - Debate ACTION wrong (or no logged verdict) → mutate from rolling mean.
+    Fail-soft: never raises.
+    """
+    summary = {"status": "skipped", "reflections": [], "reason": None}
+    try:
+        from core.self_learning_agent import TRACKED_INDICES
+        from engine.agent_debate import load_decision_log
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["reason"] = str(exc)
+        return summary
+
+    learner = _get_reflection_learner()
+    if learner is None:
+        summary["status"] = "failed"
+        summary["reason"] = "self-learning agent unavailable"
+        return summary
+
+    try:
+        decisions = load_decision_log()
+    except Exception:
+        decisions = []
+
+    lookup = _actual_lookup()
+    if not lookup:
+        summary["reason"] = "actuals_missing"
+        return summary
+
+    latest_by_index = {}
+    for (date, key), entry in lookup.items():
+        prev = latest_by_index.get(key)
+        if prev is None or date >= prev[0]:
+            latest_by_index[key] = (date, entry)
+
+    reflections = []
+    for key in TRACKED_INDICES:
+        packed = latest_by_index.get(key)
+        if not packed:
+            reflections.append({"index": key, "status": "skipped", "reason": "actuals_missing"})
+            continue
+        date, entry = packed
+        try:
+            bucket = learner.get_index_state(key)
+            last_date = str(bucket.get("last_reflected_date") or "")[:10]
+            if last_date and last_date >= date:
+                reflections.append({
+                    "index": key, "status": "skipped", "reason": "already_reflected", "date": date
+                })
+                continue
+        except Exception:
+            pass
+
+        actual_close = _finite_number((entry.get("actual") or {}).get("close"))
+        if actual_close is None:
+            reflections.append({"index": key, "status": "skipped", "reason": "actuals_missing", "date": date})
+            continue
+
+        decision = _latest_decision_for(decisions, date, key)
+        pred_close = _pred_close_for(entry, decision)
+        if pred_close is None:
+            reflections.append({"index": key, "status": "skipped", "reason": "pred_close_missing", "date": date})
+            continue
+
+        mutate = True
+        action_score = None
+        if decision is not None:
+            verdict = decision.get("verdict") if isinstance(decision.get("verdict"), dict) else {}
+            action_score = score_debate_action(verdict.get("action"), entry.get("actual"))
+            if not action_score.get("scored"):
+                reflections.append({
+                    "index": key, "status": "skipped", "reason": "actuals_missing", "date": date
+                })
+                continue
+            mutate = bool(action_score.get("action_wrong"))
+
+        try:
+            log = learner.execute_self_reflection_learning(
+                pred_close,
+                actual_close,
+                index=key,
+                mutate_prompt=mutate,
+                session_date=date,
+            )
+            reflections.append({
+                "index": key,
+                "status": "reflected",
+                "date": date,
+                "mutated": mutate,
+                "action_score": action_score,
+                "log": log,
+            })
+        except Exception as exc:
+            reflections.append({"index": key, "status": "failed", "reason": str(exc), "date": date})
+
+    summary["reflections"] = reflections
+    if any(r.get("status") == "reflected" for r in reflections):
+        summary["status"] = "reflected"
+    elif all(r.get("reason") == "already_reflected" for r in reflections if r.get("status") == "skipped"):
+        summary["status"] = "already_reflected"
+    else:
+        summary["status"] = "skipped"
+        summary["reason"] = summary["reason"] or "no_eligible_sessions"
+    return summary
+

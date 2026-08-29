@@ -107,6 +107,54 @@ def run_quant_cycle(indices: list | None = None, verbose: bool = True):
 
     # ── 3. Per-Index Processing Loop ─────────────────────────────────────
 
+    situational: dict | None = None
+    try:
+        from engine.situational_quant import evaluate_live_vitals
+
+        situational = evaluate_live_vitals()
+    except Exception as exc:
+        situational = {
+            "tripped": True,
+            "message": (
+                f"[SITUATIONAL TACKLE ACTIVATED] VITALS UNREADABLE: {exc}. "
+                "Bypassing active portfolio deployment lanes. Status set to HOLD."
+            ),
+        }
+    if verbose and situational and situational.get("tripped"):
+        _log("HOLD", situational.get("message", "situational tackle"))
+
+    flatten_result = None
+    if situational and situational.get("tripped"):
+        try:
+            from engine.situational_quant import (
+                flatten_paper_on_vix_emergency,
+                is_vix_emergency,
+            )
+
+            if is_vix_emergency(situational):
+                flatten_result = flatten_paper_on_vix_emergency(
+                    situational, brokerage=brokerage
+                )
+                if verbose:
+                    _log(
+                        "FLATTEN",
+                        (
+                            f"VIX emergency paper flatten "
+                            f"reason={flatten_result.get('reason')} "
+                            f"fills={len(flatten_result.get('fills') or [])}"
+                        ),
+                    )
+        except Exception as exc:
+            flatten_result = {
+                "ok": False,
+                "flattened": False,
+                "reason": "flatten_error",
+                "error": str(exc),
+                "live_brokers_touched": False,
+            }
+            if verbose:
+                _log("FLATTEN", f"Paper flatten skipped: {exc}")
+
     if verbose:
         _log("CYCLE", "Starting per-index processing...")
 
@@ -123,8 +171,12 @@ def run_quant_cycle(indices: list | None = None, verbose: bool = True):
             genetic_engine=genetic_engine,
             brokerage=brokerage,
             verbose=verbose,
+            situational=situational,
         )
         results[index_name] = idx_result
+
+    if flatten_result is not None:
+        results["_paper_flatten"] = flatten_result
 
     # ── 4. Save State ────────────────────────────────────────────────────
 
@@ -148,6 +200,7 @@ def _process_index(
     genetic_engine: StrategyGeneticEngine,
     brokerage: PaperBrokerage,
     verbose: bool = True,
+    situational: dict | None = None,
 ) -> dict:
     """Process one index through the full quant pipeline."""
 
@@ -246,7 +299,20 @@ def _process_index(
                      f"E[maxDD]={risk_metrics['expected_max_drawdown']:.4f}, "
                      f"passed={risk_metrics['passed']}")
 
-    # ── Step 5: Execute or Evolve ────────────────────────────────────────
+    # ── Step 5: Situational tackle (independent of Monte Carlo ruin) ──────
+
+    if situational and situational.get("tripped"):
+        result["trade"] = {
+            "status": "blocked",
+            "reason": "situational_tackle",
+            "log": situational.get("message"),
+        }
+        result["situational"] = situational
+        if verbose:
+            _log("HOLD", "  Situational tackle — skipping paper execution.")
+        return result
+
+    # ── Step 6: Execute or Evolve ────────────────────────────────────────
 
     if risk_metrics["passed"]:
         if verbose:

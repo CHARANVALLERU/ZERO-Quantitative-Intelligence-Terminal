@@ -37,6 +37,11 @@ import math
 import os
 from typing import Any, Dict, List, Optional
 
+try:
+    from engine.okf_context import get_okf_hits
+except Exception:
+    get_okf_hits = lambda *a, **k: ""  # noqa: E731
+
 
 # ── Env helpers (never raise at import time) ───────────────────────────────
 
@@ -244,6 +249,36 @@ def _parse_pm_payload(data: Dict[str, Any], prediction: Dict[str, Any]) -> Dict[
     }
 
 
+def _situational_hold_result(index_name: str, message: str) -> Dict[str, Any]:
+    """HOLD verdict when SituationalQuantTackle trips — skip the debate graph."""
+    log = str(message or "Situational tackle HOLD.")
+    return {
+        "bull_case": {
+            "arguments": ["Situational tackle HOLD — agent debate graph bypassed."],
+            "strength": 0.0,
+        },
+        "bear_case": {
+            "arguments": ["Autonomous debate skipped due to VIX/latency interceptor."],
+            "strength": 0.0,
+        },
+        "risk_assessment": {
+            "risk_level": "EXTREME",
+            "notes": [log[:400]],
+        },
+        "pm_verdict": {
+            "action": "HOLD",
+            "conviction": 0.0,
+            "kill_condition": "situational_quant override — no new risk",
+            "position_size_hint_pct": 0.0,
+            "reasoning": log[:600],
+        },
+        "rounds": 0,
+        "llm_used": False,
+        "model": None,
+        "situational_override": True,
+    }
+
+
 def _emergency_result(index_name: str, prediction: Any) -> Dict[str, Any]:
     """Last-resort valid-schema result — the public API never raises."""
     return {
@@ -272,6 +307,44 @@ def _emergency_result(index_name: str, prediction: Any) -> Dict[str, Any]:
     }
 
 
+# ── Lazy Lead PM prompt (do not reload JSON every token) ───────────────────
+_learner_agent: Any = None
+_learner_failed = False
+
+
+def _get_learner() -> Any:
+    """Process-wide SelfLearningQuantAgent singleton. Fail-soft."""
+    global _learner_agent, _learner_failed
+    if _learner_failed:
+        return None
+    if _learner_agent is not None:
+        return _learner_agent
+    try:
+        from core.self_learning_agent import SelfLearningQuantAgent
+
+        _learner_agent = SelfLearningQuantAgent()
+        return _learner_agent
+    except Exception as exc:
+        print(f"[agent_debate] self-learning agent unavailable: {exc}")
+        _learner_failed = True
+        return None
+
+
+def _lead_pm_prompt(index_name: str) -> str:
+    """Cached Lead PM standing order for this process. Never raises."""
+    try:
+        learner = _get_learner()
+        if learner is None:
+            return ""
+        getter = getattr(learner, "get_current_prompt", None)
+        if not callable(getter):
+            return ""
+        prompt = getter(index_name)
+        return str(prompt).strip() if prompt else ""
+    except Exception:
+        return ""
+
+
 class AgentDebateEngine:
     """
     Bull-vs-bear debate engine with an optional Gemini LLM path and a
@@ -287,6 +360,7 @@ class AgentDebateEngine:
         self._use_old_sdk = False
         self._llm_checked = False
         self._llm_available = False
+        self._lead_pm_prompt: str = ""
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -297,6 +371,7 @@ class AgentDebateEngine:
         news_items: list | None = None,
         sentiment_data: dict | None = None,
         option_chain: dict | None = None,
+        query: str | None = None,
     ) -> dict:
         """
         Run a 3-round bull/bear/PM debate over a prediction dict.
@@ -312,16 +387,32 @@ class AgentDebateEngine:
             news = news_items if isinstance(news_items, list) else []
             sent = sentiment_data if isinstance(sentiment_data, dict) else {}
             oc = option_chain if isinstance(option_chain, dict) else {}
+            q = str(query).strip() if query else idx
+            # One prompt fetch per debate — learner is a process singleton.
+            self._lead_pm_prompt = _lead_pm_prompt(idx)
+
+            try:
+                from engine.situational_quant import evaluate_live_vitals
+
+                vitals = evaluate_live_vitals()
+                if vitals.get("tripped"):
+                    result = _situational_hold_result(
+                        idx, str(vitals.get("message") or "HOLD")
+                    )
+                    self._log_decision(idx, pred, result)
+                    return result
+            except Exception:
+                pass
 
             result: Optional[Dict[str, Any]] = None
             if self._ensure_llm():
                 try:
-                    result = self._llm_debate(idx, pred, news, sent, oc)
+                    result = self._llm_debate(idx, pred, news, sent, oc, query=q)
                 except Exception as exc:
                     print(f"[agent_debate] LLM debate failed, using fallback: {exc}")
                     result = None
             if result is None:
-                result = self._fallback_debate(idx, pred, news, sent, oc)
+                result = self._fallback_debate(idx, pred, news, sent, oc, query=q)
 
             self._log_decision(idx, pred, result)
             return result
@@ -448,9 +539,22 @@ class AgentDebateEngine:
         news_items: list,
         sentiment_data: Dict[str, Any],
         option_chain: Dict[str, Any],
+        query: str | None = None,
     ) -> str:
         """Small prompt context: prediction numbers, top-5 news titles, PCR/OI walls."""
         lines = [f"Index: {index_name}"]
+        lead = (self._lead_pm_prompt or "").strip()
+        if lead:
+            lines.append(f"Lead PM standing order: {lead}")
+        okf_query = (query or index_name or "").strip()
+        if okf_query:
+            try:
+                hits = get_okf_hits(okf_query, k=3)
+            except Exception:
+                hits = ""
+            if hits and str(hits).strip():
+                lines.append("OKF knowledge hits:")
+                lines.append(str(hits).strip()[:1800])
         for key, label in _PRED_KEYS:
             f = _num(prediction.get(key), default=float("nan"))
             if not math.isnan(f):
@@ -510,9 +614,12 @@ class AgentDebateEngine:
         news_items: list,
         sentiment_data: Dict[str, Any],
         option_chain: Dict[str, Any],
+        query: str | None = None,
     ) -> Optional[Dict[str, Any]]:
         """3 forced-JSON LLM rounds. Returns None if any stage fails (caller falls back)."""
-        context = self._compact_context(index_name, prediction, news_items, sentiment_data, option_chain)
+        context = self._compact_context(
+            index_name, prediction, news_items, sentiment_data, option_chain, query=query
+        )
 
         # Round 1 — Bull Researcher argues FOR the predicted move
         bull_prompt = (
@@ -547,7 +654,10 @@ class AgentDebateEngine:
             return None
 
         # Round 3 — Risk Manager + Portfolio Manager synthesize the verdict
+        lead = (self._lead_pm_prompt or "").strip()
+        lead_block = (lead + "\n\n") if lead else ""
         pm_prompt = (
+            f"{lead_block}"
             f"You are the RISK MANAGER and PORTFOLIO MANAGER of an Indian index desk.\n"
             f"Weigh this debate and issue the final verdict for {index_name}.\n\n"
             f"{context}\n\n"
@@ -585,6 +695,7 @@ class AgentDebateEngine:
         news_items: list,
         sentiment_data: Dict[str, Any],
         option_chain: Dict[str, Any],
+        query: str | None = None,
     ) -> Dict[str, Any]:
         """
         Pseudo-debate derived from multi_agent_consensus.py scoring style:
@@ -727,6 +838,21 @@ class AgentDebateEngine:
         if atr_pct >= 2.5:
             risk_notes.append(f"ATR {atr_pct:.2f}% of spot signals structural volatility.")
 
+        lead = (self._lead_pm_prompt or "").strip()
+        tighten_pm = False
+        if lead:
+            risk_notes.append(f"Lead PM standing order: {lead[:220]}")
+            low = lead.lower()
+            tighten_pm = any(tok in low for tok in ("warning", "tighten", "drift"))
+        okf_query = (query or index_name or "").strip()
+        if okf_query:
+            try:
+                hits = get_okf_hits(okf_query, k=3)
+            except Exception:
+                hits = ""
+            if hits and str(hits).strip():
+                risk_notes.append(f"OKF hits: {str(hits).strip()[:180]}")
+
         if vix >= _VIX_EXTREME or range_pct >= 4.0:
             risk_level = "EXTREME"
         elif vix >= _VIX_HIGH or range_pct >= 3.0 or atr_pct >= 3.0:
@@ -740,9 +866,12 @@ class AgentDebateEngine:
         net = bull_strength - bear_strength
         if risk_level in ("HIGH", "EXTREME"):
             net *= 0.7  # consensus-engine style risk penalty
+        if tighten_pm:
+            net *= 0.7  # mutated Lead PM: treat as extra risk haircut
         conviction = round(min(abs(net), 1.0), 3)
 
-        if risk_level == "EXTREME" or conviction < _MIN_CONVICTION:
+        min_conviction = _MIN_CONVICTION * (1.35 if tighten_pm else 1.0)
+        if risk_level == "EXTREME" or conviction < min_conviction:
             action = "WAIT"
         elif net > 0:
             action = "LONG"
@@ -760,6 +889,8 @@ class AgentDebateEngine:
             size = 0.0
         if action == "WAIT":
             size = 0.0
+        if tighten_pm:
+            size *= 0.5
         size = round(min(size, 10.0), 1)
 
         reasoning = (
@@ -843,10 +974,18 @@ def load_decision_log(limit: int | None = None) -> list:
 
 def verdict_accuracy_placeholder() -> dict:
     """
-    Stub for a future accuracy scorer: an orchestrator can join each logged
-    verdict's prediction_snapshot against that session's realized OHLC and
-    compute hit-rates per action. Never raises.
+    Join db/agent_decisions.jsonl against learning_service realized OHLC.
+    Scores HOLD/WAIT vs BUY/LONG vs SELL/SHORT. Entries without actuals
+    stay pending — they do not mutate learner weights. Never raises.
     """
+    try:
+        from engine.learning_service import score_logged_decisions
+
+        scored = score_logged_decisions()
+        if isinstance(scored, dict):
+            return scored
+    except Exception as exc:
+        print(f"[agent_debate] verdict accuracy join failed: {exc}")
     pending = 0
     try:
         pending = len(load_decision_log())

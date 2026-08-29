@@ -30,6 +30,8 @@ db/vault_sync_queue.json
 db/aite_build_progress.json
 db/agent_decisions.jsonl
 db/india_vix_last.json
+db/okf_financial_chroma/
+db/self_learning_quant_weights.json
 
 # Local session flags
 .zero_session.json

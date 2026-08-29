@@ -26,5 +26,8 @@ echo Launching ZERO Prediction Engine...
 if exist "setup_scheduler.bat" (
     start "" "setup_scheduler.bat"
 )
+:: Optional once-per-install MiniLM warmup (do NOT uncomment for every launch —
+:: that would re-check / potentially re-download ~80 MB on each start):
+:: python scripts\warmup_okf_embeddings.py
 streamlit run app.py
 pause

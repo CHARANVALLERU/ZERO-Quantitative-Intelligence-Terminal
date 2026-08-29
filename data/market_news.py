@@ -14,10 +14,13 @@ a rich dict in the same shape the rest of the engine already consumes.
 """
 import os
 import re
+import logging
 try:
     import feedparser
 except ImportError:  # optional: news scraping degrades to last-good/empty offline
     feedparser = None
+
+logger = logging.getLogger("ZERO_MARKET_NEWS")
 
 from config import USER_AGENT
 from data.cache import get_or_fetch
@@ -357,6 +360,7 @@ def _bg_worker():
                 from data.cache import set_
                 set_(CACHE_KEY, val)
                 lg_save(SOURCE_NAME, val)
+                _okf_auto_ingest(val)
         except Exception:
             pass
         time.sleep(15)
@@ -371,6 +375,34 @@ def start_background_scraper():
                 _bg_started = True
 
 
+_okf_ingest_sig = None
+
+
+def _okf_auto_ingest(items):
+    """Fail-soft OKF index of the current tape. Never raises into the news UI."""
+    global _okf_ingest_sig
+    if not items:
+        return
+    titles = tuple(
+        ((it.get("title") if isinstance(it, dict) else str(it)) or "")
+        for it in list(items)[:20]
+    )
+    if titles == _okf_ingest_sig:
+        return
+    _okf_ingest_sig = titles
+
+    def _run():
+        try:
+            from engine.okf_context import ingest_headlines
+            ingest_headlines(list(items)[:20], source_type="Market_News")
+        except RuntimeError as exc:
+            logger.warning("OKF auto-ingest skipped (RAG unavailable): %s", exc)
+        except Exception as exc:
+            logger.warning("OKF auto-ingest failed: %s", exc)
+
+    threading.Thread(target=_run, daemon=True, name="ZERO-OKF-Ingest").start()
+
+
 def get_global_news():
     """Returns list of news items, with the same shape used everywhere."""
     start_background_scraper()
@@ -380,8 +412,10 @@ def get_global_news():
     if value is None:
         last, age = lg_load(SOURCE_NAME)
         if last is not None:
+            _okf_auto_ingest(last)
             return last
         return []
+    _okf_auto_ingest(value)
     return value
 
 

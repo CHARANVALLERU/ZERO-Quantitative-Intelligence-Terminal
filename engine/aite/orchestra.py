@@ -462,6 +462,41 @@ class Orchestra:
         from engine.aite.models import BotGenome
         from engine.aite.portfolio import rebalance_and_cut
         from engine.aite.survivors import compute_live_edge
+        from engine.situational_quant import (
+            fills_blocked_by_vitals,
+            flatten_paper_on_vix_emergency,
+            is_vix_emergency,
+        )
+
+        blocked, vitals = fills_blocked_by_vitals()
+        if blocked:
+            flatten: Dict[str, Any] = {}
+            if is_vix_emergency(vitals):
+                flatten = flatten_paper_on_vix_emergency(vitals)
+                self.swarm.done("execution", "VIX emergency — paper flatten, new fills skipped")
+            else:
+                self.swarm.done("execution", "Situational HOLD — new fills skipped")
+            log_activity(
+                f"Edge monitor HOLD blocked_by=situational_quant "
+                f"reason={vitals.get('trip_reason')} flattened={flatten.get('flattened')}",
+                level="TRADE",
+                source="orchestra",
+                blocked_by="situational_quant",
+                trip_reason=vitals.get("trip_reason"),
+                flattened=flatten.get("flattened"),
+            )
+            return {
+                "ok": True,
+                "held": True,
+                "blocked_by": "situational_quant",
+                "message": vitals.get("message"),
+                "trip_reason": vitals.get("trip_reason"),
+                "flatten": flatten,
+                "kept": None,
+                "killed": [],
+                "allocations": {},
+                "replacements": [],
+            }
 
         self.swarm.work("execution", "Monitoring live edge / cut-replace")
         reb = rebalance_and_cut()

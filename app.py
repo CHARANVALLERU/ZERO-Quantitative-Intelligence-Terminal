@@ -33,6 +33,40 @@ try:
     from ui.aite import render_aite_panel
 except Exception:
     render_aite_panel = None
+
+# ── Aegis-Quant: situational interceptor + OKF RAG + self-learning ──────────
+# Heavy RAG/embedding stacks stay lazy (session_state). Import failures must
+# never prevent the rest of the dashboard from booting.
+try:
+    from engine.situational_quant import (
+        SituationalQuantTackle,
+        resolve_india_vix as resolve_aegis_india_vix,
+        probe_server_latency as probe_aegis_server_latency,
+        existing_broker_interlock,
+        DEFAULT_INDIA_VIX,
+        DEFAULT_SERVER_LATENCY_MS,
+        VIX_MAX_EMERGENCY_LIMIT,
+        LATENCY_MAX_LIMIT_MS,
+    )
+except Exception:
+    SituationalQuantTackle = None
+    resolve_aegis_india_vix = None
+    probe_aegis_server_latency = None
+    existing_broker_interlock = None
+    DEFAULT_INDIA_VIX = 16.5
+    DEFAULT_SERVER_LATENCY_MS = 45.0
+    VIX_MAX_EMERGENCY_LIMIT = 28.0
+    LATENCY_MAX_LIMIT_MS = 500.0
+
+try:
+    from core.okf_financial_rag import OKFFinancialRAG
+except Exception:
+    OKFFinancialRAG = None
+
+try:
+    from core.self_learning_agent import SelfLearningQuantAgent
+except Exception:
+    SelfLearningQuantAgent = None
 from engine.learning_service import log_daily_feedback, get_feedback_logs, calculate_engine_accuracy, fetch_daily_actuals, update_feedback_logs, update_unfulfilled_feedback_logs, auto_train_engine
 from ui.charts import ohlc_range_chart, sentiment_gauge_chart
 from ui.news_feed import (
@@ -690,8 +724,8 @@ cyber_ff(st.session_state.get('news_feed') or m.get('latest_news'))
 
 st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
 
-# Six-Page System (Tabs)
-tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5 = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY"])
+# Primary tab console (AEGIS QUANT appended so existing tab indices stay stable)
+tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5, tab_aegis = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY", "AEGIS QUANT"])
 
 # UI: remember active tab across auto-refreshes; badge unread breaking items.
 persist_active_tab()
@@ -699,7 +733,6 @@ tab_unread_badge(len(st.session_state.get('news_breaking', []) or []), tab_index
 
 # Core 5 + UI 3: live status pill (news freshness + countdown to next refresh).
 try:
-    import datetime as _dt
     _ca = None
     _cb = st.session_state.get('news_checked_at')
     if _cb:
@@ -707,6 +740,326 @@ try:
     status_pill(NEWS_REFRESH_SECONDS, int(_ca or 0), healthy=bool(st.session_state.get('news_feed')))
 except Exception:
     pass
+
+_AEGIS_UNSET = object()
+
+
+def _aegis_okf_rag():
+    """Lazy session singleton — avoid reloading the embedding model on every rerun."""
+    cached = st.session_state.get("aegis_okf_rag", _AEGIS_UNSET)
+    if cached is not _AEGIS_UNSET and (cached is not None or OKFFinancialRAG is None):
+        return cached, st.session_state.get("aegis_okf_error")
+    if OKFFinancialRAG is None:
+        st.session_state["aegis_okf_rag"] = None
+        st.session_state["aegis_okf_error"] = (
+            "OKFFinancialRAG is unavailable (core.okf_financial_rag failed to import). "
+            "Install langchain-huggingface, langchain-chroma, langchain-community, "
+            "langchain-core, chromadb, and sentence-transformers (see requirements.txt), then rerun."
+        )
+        return None, st.session_state["aegis_okf_error"]
+    try:
+        st.session_state["aegis_okf_rag"] = OKFFinancialRAG()
+        st.session_state["aegis_okf_error"] = None
+    except Exception as exc:
+        st.session_state["aegis_okf_rag"] = None
+        st.session_state["aegis_okf_error"] = f"OKF RAG init failed: {exc}"
+    return st.session_state.get("aegis_okf_rag"), st.session_state.get("aegis_okf_error")
+
+
+def _aegis_learning_agent():
+    """Lazy session singleton for the offline prompt-mutator."""
+    cached = st.session_state.get("aegis_learn_agent", _AEGIS_UNSET)
+    if cached is not _AEGIS_UNSET and (cached is not None or SelfLearningQuantAgent is None):
+        return cached, st.session_state.get("aegis_learn_error")
+    if SelfLearningQuantAgent is None:
+        st.session_state["aegis_learn_agent"] = None
+        st.session_state["aegis_learn_error"] = (
+            "SelfLearningQuantAgent is unavailable (core.self_learning_agent failed to import)."
+        )
+        return None, st.session_state["aegis_learn_error"]
+    try:
+        st.session_state["aegis_learn_agent"] = SelfLearningQuantAgent()
+        st.session_state["aegis_learn_error"] = None
+    except Exception as exc:
+        st.session_state["aegis_learn_agent"] = None
+        st.session_state["aegis_learn_error"] = f"Self-learning agent init failed: {exc}"
+    return st.session_state.get("aegis_learn_agent"), st.session_state.get("aegis_learn_error")
+
+
+def _aegis_current_prompt(agent, index=None):
+    if agent is None:
+        return None
+    getter = getattr(agent, "get_current_prompt", None)
+    if callable(getter):
+        try:
+            return getter(index) if index is not None else getter()
+        except TypeError:
+            try:
+                return getter()
+            except Exception:
+                return None
+        except Exception:
+            return None
+    state_fn = getattr(agent, "get_state", None)
+    if callable(state_fn):
+        try:
+            state = state_fn() or {}
+            if isinstance(state, dict):
+                return state.get("current_dynamic_prompt")
+        except Exception:
+            return None
+    return None
+
+
+def render_aegis_quant_panel(matrix=None):
+    """Aegis-Quant console: OKF ingest, situational vitals, self-learning loop."""
+    if render_section_header is not None:
+        try:
+            render_section_header("AQ", "AEGIS-QUANT: AUTONOMOUS RISK & SELF-LEARNING")
+        except Exception:
+            st.markdown("<h2 class='gold-title'>AEGIS-QUANT: AUTONOMOUS RISK & SELF-LEARNING MODULE</h2>", unsafe_allow_html=True)
+    else:
+        st.markdown("<h2 class='gold-title'>AEGIS-QUANT: AUTONOMOUS RISK & SELF-LEARNING MODULE</h2>", unsafe_allow_html=True)
+    st.markdown(
+        "<p class='label-grey' style='margin-bottom: 20px;'>"
+        "On-prem OKF RAG, self-correction, and situational overrides. "
+        "A VIX/latency trip blocks new AITE deploy and orchestrator paper orders, "
+        "skips the agent-debate graph, and does not replace the broker interlock or Monte Carlo ruin gate."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    if resolve_aegis_india_vix is not None:
+        india_vix, vix_source = resolve_aegis_india_vix(matrix)
+    else:
+        india_vix, vix_source = DEFAULT_INDIA_VIX, "default"
+    if probe_aegis_server_latency is not None:
+        server_latency_ms, latency_source = probe_aegis_server_latency()
+    else:
+        server_latency_ms, latency_source = DEFAULT_SERVER_LATENCY_MS, "default"
+
+    nifty = (matrix or {}).get("NIFTY 50") if isinstance(matrix, dict) else None
+    nifty = nifty if isinstance(nifty, dict) else {}
+    try:
+        default_pred = float(nifty.get("pred_close") or 24200.0)
+    except (TypeError, ValueError):
+        default_pred = 24200.0
+    try:
+        default_actual = float(nifty.get("prev_close") or 23500.0)
+    except (TypeError, ValueError):
+        default_actual = 23500.0
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("<p class='gold-title' style='font-size:0.85rem;'>INGEST UNSTRUCTURED CORPORATE DOCUMENTS</p>", unsafe_allow_html=True)
+        rag, rag_err = _aegis_okf_rag()
+        if rag_err:
+            st.error(rag_err)
+
+        doc_title = st.text_input(
+            "Document / Earnings Title",
+            value="Reliance Q3 Financial Report Summary",
+            key="aegis_doc_title",
+        )
+        raw_text = st.text_area(
+            "Paste corporate data or earnings-transcript payload",
+            key="aegis_raw_text",
+            height=180,
+        )
+        if st.button("Process & Convert to OKF", key="aegis_okf_convert", width="stretch"):
+            if rag is None:
+                st.warning("OKF RAG is not initialized — ingest is disabled until the error above is resolved.")
+            else:
+                try:
+                    okf_string = rag.convert_to_okf_format(doc_title, raw_text, source_type="Corporate_Filing")
+                    status = rag.index_okf_document(okf_string)
+                    st.session_state["aegis_last_okf"] = okf_string
+                    st.success(status)
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except RuntimeError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"OKF convert/index failed: {exc}")
+
+        last_okf = st.session_state.get("aegis_last_okf")
+        if last_okf:
+            st.text_area(
+                "Generated Open Knowledge Format",
+                value=last_okf,
+                height=160,
+                disabled=True,
+            )
+
+        st.markdown("<p class='label-grey' style='margin-top:18px;'>OFFLINE NEWS TAPE</p>", unsafe_allow_html=True)
+        if st.button("Ingest last 20 headlines", key="aegis_ingest_okf_20", width="stretch"):
+            try:
+                from engine.okf_context import ingest_last_headlines
+                msg = ingest_last_headlines(20)
+                st.success(msg)
+            except RuntimeError as exc:
+                st.warning(str(exc))
+            except Exception as exc:
+                st.warning(f"OKF ingest skipped: {exc}")
+
+        st.markdown("<p class='label-grey' style='margin-top:18px;'>LOCAL SEMANTIC RETRIEVAL</p>", unsafe_allow_html=True)
+        rag_query = st.text_input("Query the local OKF index", key="aegis_rag_query")
+        if st.button("Retrieve from local vector matrix", key="aegis_rag_search", width="stretch"):
+            if rag is None:
+                st.warning("OKF RAG is not initialized — retrieval is disabled.")
+            elif not (rag_query or "").strip():
+                st.warning("Enter a retrieval query.")
+            else:
+                try:
+                    hits = rag.local_semantic_retrieval(rag_query.strip(), k=2)
+                    st.session_state["aegis_last_hits"] = hits or ""
+                    st.session_state["aegis_last_hits_empty"] = not bool(hits)
+                except RuntimeError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Retrieval failed: {exc}")
+
+        last_hits = st.session_state.get("aegis_last_hits")
+        if last_hits:
+            st.text_area("Retrieval hits", value=last_hits, height=160, disabled=True)
+        elif st.session_state.get("aegis_last_hits_empty"):
+            st.info("No indexed documents matched. Ingest an OKF record first.")
+
+    with col_b:
+        st.markdown("<p class='gold-title' style='font-size:0.85rem;'>SITUATIONAL EVALUATION & SELF-LEARNING</p>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='digital-card' style='margin-bottom:12px;'>"
+            f"<p class='label-grey'>LIVE VITALS</p>"
+            f"<div style='display:flex;justify-content:space-between;gap:12px;'>"
+            f"<div><div style='color:#888;font-size:0.62rem;'>INDIA VIX</div>"
+            f"<div style='color:#fff;font-weight:800;font-size:1.2rem;'>{india_vix:.2f}</div>"
+            f"<div class='label-grey' style='font-size:0.55rem;'>{vix_source} · trip &gt; {VIX_MAX_EMERGENCY_LIMIT:g}</div></div>"
+            f"<div><div style='color:#888;font-size:0.62rem;'>PRICE-SERVER LATENCY</div>"
+            f"<div style='color:#fff;font-weight:800;font-size:1.2rem;'>{server_latency_ms:.1f} ms</div>"
+            f"<div class='label-grey' style='font-size:0.55rem;'>{latency_source} · HOLD &gt; {LATENCY_MAX_LIMIT_MS:g} ms</div></div>"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        if SituationalQuantTackle is None:
+            st.error("SituationalQuantTackle failed to import — interceptor unavailable.")
+        else:
+            is_tripped, emergency_log = SituationalQuantTackle.inspect_market_vitals(
+                india_vix, server_latency_ms
+            )
+            if is_tripped:
+                st.error(emergency_log)
+            else:
+                st.success(emergency_log)
+
+        if existing_broker_interlock is not None:
+            try:
+                interlock = existing_broker_interlock()
+                st.caption(
+                    f"Broker safety interlock: {interlock.get('label')} "
+                    f"(ZERO_BROKER_ARMED={interlock.get('env_value')}). "
+                    "Independent of situational tackle — not armed or disarmed here."
+                )
+            except Exception:
+                pass
+        else:
+            st.caption("Monte Carlo ruin gate in the quant orchestrator remains a separate pre-trade layer.")
+
+        st.markdown("---")
+        st.markdown("<p class='label-grey'>MOCK SELF-LEARNING BACKTEST FEEDBACK</p>", unsafe_allow_html=True)
+        agent, learn_err = _aegis_learning_agent()
+        if learn_err:
+            st.error(learn_err)
+
+        learn_index = st.selectbox(
+            "Index book",
+            ("NIFTY", "BANKNIFTY", "SENSEX"),
+            key="aegis_learn_index",
+        )
+        p_close = st.number_input(
+            "Model predicted target close",
+            value=float(default_pred),
+            step=10.0,
+            key="aegis_pred_close",
+        )
+        a_close = st.number_input(
+            "Actual realized market close",
+            value=float(default_actual),
+            step=10.0,
+            key="aegis_actual_close",
+        )
+        if st.button("Execute self-learning prompt tuning loop", key="aegis_tune", width="stretch"):
+            if agent is None:
+                st.warning("Self-learning agent is not initialized.")
+            else:
+                try:
+                    feedback_log = agent.execute_self_reflection_learning(
+                        p_close, a_close, index=learn_index
+                    )
+                    st.session_state["aegis_last_learn_log"] = feedback_log
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except Exception as exc:
+                    st.error(f"Self-learning loop failed: {exc}")
+
+        learn_log = st.session_state.get("aegis_last_learn_log")
+        if learn_log:
+            if "SKIPPED" in str(learn_log):
+                st.warning(learn_log)
+            else:
+                st.info(learn_log)
+
+        prompt = _aegis_current_prompt(agent, learn_index)
+        if prompt:
+            st.markdown("<p class='label-grey' style='margin-top:12px;'>CURRENT DYNAMIC PROMPT</p>", unsafe_allow_html=True)
+            st.code(str(prompt), language="text")
+
+        if agent is not None:
+            try:
+                state = agent.get_state() or {}
+                cycles = state.get("tuning_cycles_completed", 0)
+                last_var = state.get("last_variance_error")
+                last_pred = state.get("last_predicted_close")
+                last_act = state.get("last_actual_close")
+                st.caption(
+                    f"Learning state · cycles={cycles} · last variance="
+                    f"{last_var if last_var is not None else '—'} · "
+                    f"last pred/actual={last_pred if last_pred is not None else '—'}/"
+                    f"{last_act if last_act is not None else '—'}"
+                )
+                indices = state.get("indices") if isinstance(state.get("indices"), dict) else {}
+                if indices:
+                    bits = []
+                    for name in ("NIFTY", "BANKNIFTY", "SENSEX"):
+                        bucket = indices.get(name) or {}
+                        mode = bucket.get("mode") or "—"
+                        mean = bucket.get("rolling_mean_variance")
+                        mean_s = f"{mean:.4f}" if isinstance(mean, (int, float)) else "—"
+                        bits.append(f"{name} {mode} μ={mean_s}")
+                    st.caption("Per-index · " + " · ".join(bits))
+            except Exception:
+                pass
+
+
+def _render_situational_hold_banner():
+    """HOLD banner when live VIX/latency vitals trip. Reuses evaluate_live_vitals cache."""
+    try:
+        from engine.situational_quant import evaluate_live_vitals
+
+        vitals = evaluate_live_vitals()
+    except Exception as exc:
+        vitals = {
+            "tripped": True,
+            "message": (
+                f"[SITUATIONAL TACKLE ACTIVATED] VITALS UNREADABLE: {exc}. "
+                "Bypassing autonomous LLM agent frameworks. "
+                "Bypassing active portfolio deployment lanes. Status set to HOLD."
+            ),
+        }
+    if vitals.get("tripped"):
+        st.error(vitals.get("message") or "HOLD — situational tackle")
+
 
 def render_market_page(symbol, data, key_prefix):
     """Renders a market page using per-index prediction data (no multipliers)."""
@@ -808,11 +1161,14 @@ def render_market_page(symbol, data, key_prefix):
     st.plotly_chart(ohlc_range_chart(data), width='stretch', key=f"{key_prefix}_c", config={'displayModeBar': False})
 
 # Page Routing — each index gets its own independent prediction data
-with tab1: render_market_page("NIFTY 50", m.get("NIFTY 50", {}), "n1")
+with tab1:
+    _render_situational_hold_banner()
+    render_market_page("NIFTY 50", m.get("NIFTY 50", {}), "n1")
 with tab2: render_market_page("BANKNIFTY", m.get("BANKNIFTY", {}), "b1")
 with tab3: render_market_page("SENSEX", m.get("SENSEX", {}), "s1")
 
 with tab_trading:
+    _render_situational_hold_banner()
     if render_terminal_hero is not None:
         try:
             render_terminal_hero()
@@ -840,6 +1196,33 @@ with tab_trading:
         render_provider_registry_panel()
     with v11_ctrl_3:
         render_ic_memo_generator(m)
+        try:
+            from engine.report_generator import okf_memo_query
+            from engine.okf_context import get_okf_hits
+            _okf_q = okf_memo_query(m)
+            _okf_hits = get_okf_hits(_okf_q, k=3)
+        except Exception:
+            _okf_q = "NIFTY earnings macro"
+            _okf_hits = ""
+        if _okf_hits:
+            _preview = _okf_hits if len(_okf_hits) <= 480 else _okf_hits[:480].rstrip() + "…"
+            _safe = (
+                _preview.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+            _q_safe = (
+                str(_okf_q).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+            st.markdown(
+                f"<div style='margin-top:8px;padding:8px 10px;border:1px solid #D4AF3755;"
+                f"border-radius:4px;font-size:0.62rem;color:#aaa;'>"
+                f"<div style='color:#D4AF37;letter-spacing:1px;margin-bottom:4px;'>OKF · LOCAL EVIDENCE</div>"
+                f"<div style='color:#666;margin-bottom:4px;'>query · {_q_safe}</div>"
+                f"<div style='white-space:pre-wrap;max-height:120px;overflow:auto;color:#ccc;'>{_safe}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("No local OKF hits")
 
     # Strategy & Risk Advisory Bubbles (Top Section)
     cyber_bubbles(m, st.session_state.get('news_feed'))
@@ -1221,6 +1604,7 @@ with tab_kronos:
 
 with tab_aite:
     # ── ZERO AITE TAB — Automated Intelligent Trading Environment ─────────────
+    _render_situational_hold_banner()
     if render_aite_panel is not None:
         render_aite_panel()
     else:
@@ -1351,8 +1735,20 @@ with tab5:
     else:
         st.info("No prediction data logged yet.")
 
+with tab_aegis:
+    render_aegis_quant_panel(m)
+
 with tab6:
     _feed = st.session_state.get('news_feed', [])
+    if st.button("Ingest last 20 headlines", key="news_ingest_okf_20"):
+        try:
+            from engine.okf_context import ingest_last_headlines
+            _okf_msg = ingest_last_headlines(20)
+            st.success(_okf_msg)
+        except RuntimeError as exc:
+            st.warning(str(exc))
+        except Exception as exc:
+            st.warning(f"OKF ingest skipped: {exc}")
     # A live overlay summary: how the current news tape is nudging each index.
     _overlay = (m.get('news_overlay') if isinstance(m, dict) else None) or {}
     if _overlay:

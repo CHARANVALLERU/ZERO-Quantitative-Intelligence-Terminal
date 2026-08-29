@@ -29,9 +29,12 @@ import json
 import time
 import hashlib
 import datetime
+import logging
 
 from engine.news_impact import assess
 from config import NEWS_ALERT_THRESHOLD
+
+logger = logging.getLogger("ZERO_NEWS_MONITOR")
 
 SEEN_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "news_seen.json")
 _SEEN_CAP = 500
@@ -64,6 +67,25 @@ def _save_seen(seen: dict):
         pass
 
 
+def _okf_auto_ingest(items):
+    """Fail-soft OKF index. Never raises into the news UI."""
+    if not items:
+        return
+    try:
+        from data.market_news import _okf_auto_ingest as _mn_okf
+        _mn_okf(items)
+        return
+    except Exception:
+        pass
+    try:
+        from engine.okf_context import ingest_headlines
+        ingest_headlines(list(items)[:20], source_type="Market_News")
+    except RuntimeError as exc:
+        logger.warning("OKF auto-ingest skipped (RAG unavailable): %s", exc)
+    except Exception as exc:
+        logger.warning("OKF auto-ingest failed: %s", exc)
+
+
 def _enrich(item, index_levels=None):
     """Attach an impact assessment to a raw news item dict."""
     title = item.get("title") if isinstance(item, dict) else str(item)
@@ -84,6 +106,7 @@ def get_live_feed(index_levels=None, limit=30):
     safe to call on every UI refresh."""
     from data.market_news import get_global_news
     raw = get_global_news() or []
+    _okf_auto_ingest(raw)
     enriched = [_enrich(it, index_levels) for it in raw]
     enriched.sort(key=lambda x: x["impact_score"], reverse=True)
     return enriched[:limit]
@@ -113,6 +136,7 @@ def _check_breaking_raw(index_levels=None, mark_seen=True):
     """
     from data.market_news import get_global_news
     raw = get_global_news() or []
+    _okf_auto_ingest(raw)
     seen = _load_seen()
     now_ts = time.time()
 

@@ -111,13 +111,63 @@ def _venue_handles(venue: str) -> tuple[str, PaperFund, MT5Adapter | None]:
     return venue, fund, None
 
 
+def _situational_hold(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Block new autonomous deploy when VIX/latency vitals trip. Never raises."""
+    try:
+        from engine.situational_quant import evaluate_live_vitals
+
+        vitals = evaluate_live_vitals()
+    except Exception as exc:
+        vitals = {
+            "tripped": True,
+            "message": (
+                f"[SITUATIONAL TACKLE ACTIVATED] VITALS UNREADABLE: {exc}. "
+                "Bypassing autonomous LLM agent frameworks. "
+                "Bypassing active portfolio deployment lanes. Status set to HOLD."
+            ),
+        }
+    if not vitals.get("tripped"):
+        return {}
+    row = _audit(action, {
+        "ok": False,
+        "blocked_by": "situational_quant",
+        "error": vitals.get("message"),
+        **payload,
+    })
+    store.log_event(
+        "WARN",
+        f"{action} HOLD — situational tackle: {str(vitals.get('message') or '')[:180]}",
+    )
+    return {
+        "ok": False,
+        "error": vitals.get("message"),
+        "blocked_by": "situational_quant",
+        "deployed": [],
+        "audit": row,
+        "vitals": vitals,
+    }
+
+
 def deploy_bots(
     bot_ids: Sequence[str] | None = None,
     venue: str = "paper",
     *,
     note: str = "",
 ) -> Dict[str, Any]:
-    """Deploy portfolio bots to paper or MT5 paper. Ids default to full portfolio."""
+    """Deploy portfolio bots to paper or MT5 paper. Ids default to full portfolio.
+
+    SituationalQuantTackle is evaluated first: a VIX/latency trip returns
+    ``ok=False`` and does not register new deployments. Broker interlock and
+    Monte Carlo ruin remain independent gates. No live-account flatten.
+    """
+    hold = _situational_hold("deploy", {
+        "venue": venue,
+        "bot_ids": list(bot_ids or []),
+        "note": note,
+    })
+    if hold:
+        return hold
+
     venue, fund, adapter = _venue_handles(venue)
     ids = _resolve_ids(bot_ids)
     if not ids:
@@ -282,6 +332,12 @@ def swap_bot(
         return {"ok": False, "error": "out_id and in_id must differ"}
 
     venue = _normalize_venue(venue)
+
+    hold = _situational_hold("swap", {
+        "venue": venue, "out_id": out_id, "in_id": in_id, "note": note,
+    })
+    if hold:
+        return hold
 
     # Ensure in_id is on the portfolio (add if known bot)
     port = store.load_portfolio()

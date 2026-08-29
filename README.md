@@ -28,6 +28,7 @@
 - [The Quant Engines](#-the-quant-engines)
 - [KRONOS ENGINE — K-Line Foundation Model](#-kronos-engine--k-line-foundation-model)
 - [ZERO AITE — Automated Intelligent Trading Environment](#-zero-aite--automated-intelligent-trading-environment)
+- [Aegis-Quant — Offline Financial RAG & Kill Switch](#-aegis-quant--offline-financial-rag--kill-switch)
 - [The V1.1 Intelligence Layer](#-the-v11-intelligence-layer)
 - [Core Architecture](#-core-architecture)
 - [Getting Started & Installation](#-getting-started--installation)
@@ -64,6 +65,7 @@ Every new subsystem follows ZERO's core law: **optional dependencies degrade gra
 | **Provider Registry** — NSE → BSE → yfinance health-scored failover (`data/providers/`)                                                                                                | ✅ Live                 |
 | **Broker Adapters** — paper default; Dhan / Fyers / Kite / Angel One REST adapters, dual-layer armed gate + audit log                                                                  | ✅ Live (paper default) |
 | **Daily IC Memo** — deterministic FinRobot-style memo auto-written to `obsidian_vault/01_Daily_Logs/`                                                                                  | ✅ Live                 |
+| **Aegis-Quant** — offline OKF RAG (Chroma + MiniLM), debate-joined self-learning, VIX/latency kill switch, paper flatten, HOLD banners, headline ingest, IC citation chip              | ✅ Live                 |
 
 
 **Carried over from V1.0:** ZERO AGI chart analysis · live sub-100ms ticker · dynamic strategy KB dropdown · offline ZERO Brain engine · YouTube ingestion pipeline · dynamic RAG · dual-vault backup · walk-forward backtester · multi-agent consensus · Nautilus order engine · QuantDinger regimes · Fincept platform.
@@ -182,7 +184,7 @@ ZERO now ships a fully **vendored** port of **[Kronos](https://github.com/shiyu-
 
 The main tab bar gains a dedicated sixth tab, right after TRADING TERMINAL:
 
-`NIFTY 50 · BANKNIFTY · SENSEX · GLOBAL NEWS · TRADING TERMINAL ·` `**▶ KRONOS ENGINE ◀**` `· ZERO AITE · LEARNING LAB · PREDICTION HISTORY`
+`NIFTY 50 · BANKNIFTY · SENSEX · GLOBAL NEWS · TRADING TERMINAL ·` `**▶ KRONOS ENGINE ◀**` `· ZERO AITE · LEARNING LAB · PREDICTION HISTORY · AEGIS QUANT`
 
 Inside the **KRONOS ENGINE** tab, top to bottom:
 
@@ -280,7 +282,7 @@ streamlit run app.py
 
 In the main tab bar, open **ZERO AITE** (immediately after KRONOS ENGINE):
 
-`NIFTY 50 · BANKNIFTY · SENSEX · GLOBAL NEWS · TRADING TERMINAL · KRONOS ENGINE ·` `**▶ ZERO AITE ◀**` `· LEARNING LAB · PREDICTION HISTORY`
+`NIFTY 50 · BANKNIFTY · SENSEX · GLOBAL NEWS · TRADING TERMINAL · KRONOS ENGINE ·` `**▶ ZERO AITE ◀**` `· LEARNING LAB · PREDICTION HISTORY · AEGIS QUANT`
 
 Inside: 3D bot graph (custom canvas JS — **no three.js package / no CDN three.js**), backtest flow, activity logs, agent automation, and controls (fund / daemon / breed / squad / paper deploy / idea→agent / brief).
 
@@ -384,6 +386,88 @@ Copy `.env.example` → `.env` for a full checklist. **Live cash MT5 trading is 
 
 ---
 
+## 🛡️ Aegis-Quant — Offline Financial RAG & Kill Switch
+
+Aegis-Quant is ZERO's **local-only** risk and knowledge layer. It ingests OKF transcripts, news headlines, and IC memos into a persisted Chroma store, feeds those hits into the Lead PM debate, watches India VIX and feed latency as situational vitals, and lets a reflection loop mutate its own system prompt — but only when the logged debate **ACTION** was wrong versus realized OHLC. No cloud LLM, no remote vector DB, no Gemini on the ingest path.
+
+### Core modules
+
+
+| Module | Path | Role |
+| ------ | ---- | ---- |
+| **OKFFinancialRAG** | `core/okf_financial_rag.py` | Splits OKF transcript/news text and embeds it locally with HuggingFace `all-MiniLM-L6-v2` → Chroma |
+| **OKF context** | `engine/okf_context.py` | `get_okf_hits()` — retrieval helper consumed by the PM debate |
+| **SelfLearningQuantAgent** | `core/self_learning_agent.py` | Offline reflection: predicted close vs actual close → mutates the Lead PM system prompt |
+| **SituationalQuantTackle** | `engine/situational_quant.py` | Hardcoded kill switch: **India VIX > 28** OR **latency > 500ms** |
+| **MiniLM warmup** | `scripts/warmup_okf_embeddings.py` | One-shot cache of `all-MiniLM-L6-v2` so first ingest never hits the Hub |
+
+
+### What Aegis does end-to-end
+
+- **OKF hits in the PM debate** — `get_okf_hits()` injects local retrieval context into `AgentDebateEngine` so the Portfolio Manager sees transcript/news evidence, not just factor scores.
+- **Auto-ingest** — news headlines and daily IC memos are written into the same OKF Chroma store (no Gemini).
+- **Mutated Lead PM prompt** — `SelfLearningQuantAgent.get_current_prompt()` is injected into `AgentDebateEngine` after a successful reflection cycle.
+- **Nightly actuals → self-reflection** — `engine/learning_service.py` / `engine/daily_updater.py` feed realized closes into the reflection loop.
+- **Decision-log join** — the prompt mutates **only** when the logged debate `ACTION` was wrong versus realized OHLC (`db/agent_decisions.jsonl`). Correct calls do not rewrite the Lead PM prompt.
+- **Per-index rolling variance** — ~20-session rolling variance is tracked for **NIFTY 50 / BANKNIFTY / SENSEX** and shown with the self-learning state.
+- **HOLD banners** — when the tackle trips, HOLD chrome appears on **NIFTY 50**, **ZERO AITE**, and **TRADING TERMINAL** (not only the AEGIS QUANT tab).
+- **Paper-only flatten on VIX > 28** — emergency VIX trips flatten **paper** books only. Latency trips stay HOLD (no flatten). Live brokers and the `ZERO_BROKER_ARMED` interlock are never flattened by Aegis.
+- **Gate already-deployed AITE paper fills** — a trip blocks new `deploy_bots` / `swap_bot`, **and** already-deployed AITE paper fills (quant-orchestrator paper orders stay skipped; agent-debate graph returns HOLD).
+- **OKF citation chip on the IC memo** — the daily memo surfaces a citation chip when OKF hits informed the verdict.
+- **Ingest last 20 headlines** — AEGIS QUANT button that pulls the latest headlines into OKF with MiniLM only (no Gemini).
+
+### Dashboard panel
+
+```bash
+pip install -r requirements.txt
+python scripts/warmup_okf_embeddings.py   # once after install — see MiniLM warmup
+streamlit run app.py
+# or run.bat on Windows
+```
+
+Open the Streamlit terminal and use the last tab, **AEGIS QUANT**:
+
+1. **Ingest OKF** — paste a title + transcript/news body and convert, or click **Ingest last 20 headlines** (MiniLM only, no Gemini). Empty title/body on the paste path raises `ValueError` (warning in this tab only). Chunks are embedded on-device and written to `db/okf_financial_chroma`. A retrieval query box reads the same local index.
+2. **Situational vitals** — live **India VIX** via `resolve_india_vix()` → `data.india_vix.fetch_india_vix()` (fallback **16.5**) and **price-server `/health` latency** (fallback **45ms**). The tackle trips when **India VIX > 28** (purge / emergency + paper flatten) or **latency > 500ms** (HOLD, no flatten). Unreadable vitals fail closed to HOLD. A trip **blocks new AITE `deploy_bots` / `swap_bot`**, **gates already-deployed AITE paper fills**, **skips quant-orchestrator paper orders**, and **bypasses the agent-debate graph** (HOLD verdict); it does **not** flatten live broker books. Broker two-layer interlock (`ZERO_BROKER_ARMED`) and the Monte Carlo ruin gate stay independent.
+3. **Self-learning loop** — feed predicted vs actual close, or let the nightly updater do it. Zero/NaN `actual_close` returns `SKIPPED` and does **not** increment cycle counts. Reflection commits only when the decision-log join says the debate ACTION was wrong vs realized OHLC. After a successful tune, the tab shows `get_current_prompt()` plus last state and per-index ~20-session variance. Weights persist to `db/self_learning_quant_weights.json`.
+
+### Persist paths
+
+
+| Location | Contents |
+| -------- | -------- |
+| `db/okf_financial_chroma` | Chroma persist directory for OKF embeddings (gitignored) |
+| `db/self_learning_quant_weights.json` | Self-learning prompt / weight state (gitignored) |
+| `db/agent_decisions.jsonl` | Debate decision log joined at reflection time |
+
+
+### MiniLM warmup & offline flags
+
+`sentence-transformers` loads **`all-MiniLM-L6-v2` locally**. Warm the Hugging Face cache **once after install** so the first Aegis ingest never hits the Hub:
+
+```bash
+python scripts/warmup_okf_embeddings.py
+```
+
+That download is typically ~80–90 MB. After the cache is warm, Aegis-Quant stays offline. No Gemini / Hub token is required for this path. `run.bat` documents the same command as a **commented optional step** — it is **not** run on every launch.
+
+Force a cache-only load (no Hub download) with `HF_HUB_OFFLINE=1` or `ZERO_OKF_OFFLINE=1` (see `.env.example`). If the weights are not pre-cached, ingest/retrieve will raise a clear `RuntimeError` instead of hanging on the network. Run the warmup **before** setting those flags on a fresh machine.
+
+### Install
+
+Covered by the standard install — these are **required**, not extras:
+
+```bash
+pip install -r requirements.txt
+python scripts/warmup_okf_embeddings.py
+```
+
+That pulls `langchain-huggingface`, `langchain-chroma`, `langchain-community`, `langchain-core`, `chromadb`, and `sentence-transformers` with the rest of the ZERO stack.
+
+**Optional (native terminal only):** `pip install MetaTrader5` if you want the AITE MT5 paper path. It needs the MetaTrader 5 desktop terminal on Windows and is **not** required for Aegis-Quant.
+
+---
+
 ## 🧬 The V1.1 Intelligence Layer
 
 ### Session-IV Volatility Layer (`engine/volatility_forecast.py` + `data/india_vix.py`)
@@ -396,7 +480,7 @@ Optional time-series foundation model forecasts alongside the calibrated envelop
 
 ### Agent Debate Engine (`engine/agent_debate.py`)
 
-TradingAgents-style deliberation on every prediction: **Bull Researcher** argues the move, **Bear Researcher** rebuts, **Risk Manager** grades the risk, **Portfolio Manager** issues a structured verdict (`action`, `conviction`, `kill_condition`, `position_size_hint_pct`). Gemini-backed when `GEMINI_API_KEY` is set; deterministic factor-based debate otherwise. Every verdict is appended to `db/agent_decisions.jsonl` for future accuracy scoring.
+TradingAgents-style deliberation on every prediction: **Bull Researcher** argues the move, **Bear Researcher** rebuts, **Risk Manager** grades the risk, **Portfolio Manager** issues a structured verdict (`action`, `conviction`, `kill_condition`, `position_size_hint_pct`). The PM sees local OKF hits via `engine/okf_context.py` `get_okf_hits()` and the mutated Lead PM prompt from `SelfLearningQuantAgent` when one exists. Gemini-backed when `GEMINI_API_KEY` is set; deterministic factor-based debate otherwise. Every verdict is appended to `db/agent_decisions.jsonl` for future accuracy scoring (Aegis reflection joins this log and mutates the prompt only when ACTION was wrong vs realized OHLC).
 
 ### Options Intelligence (`engine/options_analytics.py` + chain snapshots)
 
@@ -420,7 +504,7 @@ Paper broker by default. Live REST adapters for **Dhan, Fyers, Zerodha Kite, Ang
 
 ### Daily IC Memo (`engine/report_generator.py`)
 
-Deterministic, FinRobot-style Investment Committee memo rendered from the prediction matrix: executive summary, per-index table with conformal bands, evidence & drivers, agent consensus & strategy, debate verdict, risk & kill conditions, disclaimer. Auto-written to `obsidian_vault/01_Daily_Logs/<date>-ZERO-Memo.md` by the daily updater and via `python cli.py memo`.
+Deterministic, FinRobot-style Investment Committee memo rendered from the prediction matrix: executive summary, per-index table with conformal bands, evidence & drivers, agent consensus & strategy, debate verdict, risk & kill conditions, disclaimer. Auto-written to `obsidian_vault/01_Daily_Logs/<date>-ZERO-Memo.md` by the daily updater and via `python cli.py memo`. When OKF retrieval informed the verdict, the memo shows an **OKF citation chip**. Headlines and memos are also auto-ingested back into the OKF store.
 
 ---
 
@@ -432,6 +516,11 @@ ZERO/
 ├── cli.py                     # Headless CLI: predict / train / backtest / update / accuracy / memo
 ├── convert_playlist.py        # YouTube Video & Playlist ingestion pipeline
 ├── config.py                  # Tickers, weights, ML + calibration parameters
+│
+├── core/                      # Offline Aegis-Quant intelligence                      [AEGIS]
+│   ├── __init__.py            #   Package exports: OKFFinancialRAG, SelfLearningQuantAgent
+│   ├── okf_financial_rag.py   #   OKF transcript/news splitter + local Chroma RAG
+│   └── self_learning_agent.py #   Predicted-vs-actual reflection → Lead PM prompt mutate
 │
 ├── data/                      # Ingestion layer (network I/O, caches, feature store)
 │   ├── live_index_service.py  #   Live NIFTY/BANKNIFTY/SENSEX price scraper (3-tier fallback)
@@ -448,16 +537,18 @@ ZERO/
 │   ├── zero_engine_kb.py      #   Dynamic RAG Knowledge Base orchestrator
 │   ├── prediction_matrix.py   #   Master per-index OHLC prediction pipeline
 │   ├── volatility_forecast.py #   EGARCH/GJR → EWMA → ATR session-IV layer               [V1.1]
+│   ├── situational_quant.py   #   India VIX > 28 / latency > 500ms kill switch           [AEGIS]
+│   ├── okf_context.py         #   get_okf_hits() → PM debate + IC citation chip          [AEGIS]
 │   ├── tsfm_predictor.py      #   Chronos-2 / Kronos / TimesFM ensemble leg              [V1.1]
 │   ├── kronos/                #   Vendored Kronos K-line foundation model (MIT)          [KRONOS]
 │   ├── kronos_service.py      #   Kronos load/forecast lazy singleton (never raises)     [KRONOS]
 │   ├── kronos_backtest.py     #   Rolling-origin Kronos walk-forward backtester          [KRONOS]
 │   ├── kronos_finetune/       #   Two-stage finetuning pipeline + YAML configs           [KRONOS]
 │   ├── kronos_results_store.py #  Forecast history store (db/kronos_predictions/)       [KRONOS]
-│   ├── agent_debate.py        #   Bull/bear → risk → PM verdict + decision log           [V1.1]
+│   ├── agent_debate.py        #   Bull/bear → risk → PM verdict + OKF-aware decision log [V1.1 + AEGIS]
 │   ├── options_analytics.py   #   OI-change, IV smile, multi-leg strategies + POP        [V1.1]
 │   ├── india_costs.py         #   Indian transaction-cost model (STT/GST/stamp/…)        [V1.1]
-│   ├── report_generator.py    #   Deterministic daily IC memo → Obsidian                 [V1.1]
+│   ├── report_generator.py    #   Deterministic daily IC memo + OKF citation chip        [V1.1 + AEGIS]
 │   ├── broker/                #   Paper + Dhan/Fyers/Kite/Angel adapters (armed-gated)   [V1.1]
 │   ├── nautilus_order_engine.py # Advanced TIF/Contingency order execution
 │   ├── fincept_platform.py    #   Quant team thesis, derivatives Greeks, inter-market
@@ -472,7 +563,8 @@ ZERO/
 │   ├── obsidian_sync.py       #   Automated daily note sync
 │   ├── brain_engine.py        #   JSON knowledge chunking & SHA1 dedup
 │   ├── calibrator.py          #   Adaptive calibration learning layer
-│   └── learning_service.py    #   Daily autonomous feedback loop
+│   ├── daily_updater.py       #   Nightly actuals → IC memo + Aegis self-reflection      [AEGIS]
+│   └── learning_service.py    #   Daily autonomous feedback + nightly Aegis reflection   [AEGIS]
 │
 ├── obsidian_vault/            # 🧠 Native Obsidian Second Brain Vault
 │   ├── ZERO.md                #   Master graph root node & map of content
@@ -484,8 +576,12 @@ ZERO/
 │   └── 05_AI_Memory/          #   Executable AI capabilities & skills
 │
 ├── ui/                        # Visual layer (Fincept/Bloomberg-style cards)
+│                              #   HOLD banners: NIFTY 50 · ZERO AITE · TRADING TERMINAL [AEGIS]
+├── scripts/
+│   └── warmup_okf_embeddings.py # One-shot all-MiniLM-L6-v2 HF cache warmup             [AEGIS]
 ├── sandbox/                   # Research notes & competitive analysis (non-runtime)      [V1.1]
 └── db/                        # SQLite, feedback logs, ZERO Brain JSON, decision/audit logs
+                               #   + okf_financial_chroma / self_learning_quant_weights.json [AEGIS]
 ```
 
 ---
@@ -506,6 +602,16 @@ cd ZERO-TERMINAL-under-work-
 pip install -r requirements.txt
 ```
 
+This installs the **required** stack, including Aegis-Quant (`langchain-huggingface`, `langchain-chroma`, `langchain-community`, `langchain-core`, `chromadb`, `sentence-transformers`). The only extra that stays optional is **MetaTrader5** — it binds to the MetaTrader 5 desktop terminal (see step 4).
+
+Warm the MiniLM cache **once** so the first AEGIS QUANT ingest does not hit Hugging Face:
+
+```bash
+python scripts/warmup_okf_embeddings.py
+```
+
+Then optionally set `HF_HUB_OFFLINE=1` and/or `ZERO_OKF_OFFLINE=1` (see `.env.example`). Do not add the warmup to every `run.bat` launch.
+
 ### 3. Running the Terminal
 
 ```bash
@@ -520,14 +626,14 @@ streamlit run app.py
 
 ### 4. Optional power-ups (V1.1)
 
-All optional — every feature degrades gracefully without them:
+Heavy ML backends stay opt-in — those features degrade gracefully without them. **MetaTrader5 is the only native-terminal extra** (requires the MetaTrader 5 desktop app). Aegis-Quant RAG packages are already in `requirements.txt`.
 
 ```bash
 pip install arch                  # EGARCH/GJR-GARCH volatility forecasts
 pip install chronos-forecasting   # Chronos-2 TSFM leg (pulls torch)
 pip install "timesfm[torch]"      # TimesFM 2.5 leg
-pip install torch torchvision einops huggingface_hub safetensors  # KRONOS ENGINE (torchvision must match torch build; quiets Streamlit+transformers)
-pip install MetaTrader5           # ZERO AITE MT5 paper path (Windows + MT5 terminal; see ZERO AITE section)
+pip install torch torchvision     # KRONOS ENGINE (torchvision must match torch build; einops / huggingface_hub / safetensors already required)
+pip install MetaTrader5           # ZERO AITE MT5 paper path — ONLY native-terminal extra (Windows + MT5)
 ```
 
 ### 5. Broker adapters (paper by default)
@@ -559,6 +665,9 @@ python cli.py update
 
 # Write today's IC memo to the Obsidian vault
 python cli.py memo
+
+# One-shot MiniLM warmup for Aegis-Quant (after install; not every launch)
+python scripts/warmup_okf_embeddings.py
 ```
 
 ---

@@ -87,6 +87,25 @@ class MT5PaperBroker:
         if quantity <= 0 or price <= 0:
             return {"status": "rejected", "reason": "invalid qty/price", "mode": self.mode}
 
+        try:
+            from engine.situational_quant import fills_blocked_by_vitals
+
+            blocked, vitals = fills_blocked_by_vitals()
+        except Exception as exc:
+            return {
+                "status": "rejected",
+                "reason": f"vitals unreadable: {exc}",
+                "blocked_by": "situational_quant",
+                "mode": self.mode,
+            }
+        if blocked:
+            return {
+                "status": "rejected",
+                "reason": str(vitals.get("message") or "situational HOLD"),
+                "blocked_by": "situational_quant",
+                "mode": self.mode,
+            }
+
         if self.mode == "mt5_paper" and self._mt5 is not None:
             return self._execute_mt5(symbol, side, quantity, price, bot_id, bot_name)
         return self._execute_sim(symbol, side, quantity, price, bot_id, bot_name)
