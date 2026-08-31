@@ -8,7 +8,6 @@ import time
 import random
 import os
 import json
-import base64
 from engine.prediction_matrix import generate_prediction_matrix, rederive_with_overlay
 from ui.components import apply_digital_core_theme, digital_clock_component, predicted_info_card, sidebar_news_section, show_zero_digital_splash, order_flow_table, automated_training_dashboard, learning_stats_card, render_zero_engine_modal, render_zero_brain_sidebar, render_youtube_knowledge_sidebar, render_trading_strategy_bubbles, render_forexfactory_priority_card, render_trading_agents_panel, render_quantdinge_strategy_card, render_fincept_thesis_card, render_nautilus_order_card, render_intermarket_card, render_options_greeks_card, render_live_price_ticker, render_zero_agi_sidebar, render_zero_agi_modal
 from ui.v11_components import (
@@ -33,6 +32,12 @@ try:
     from ui.aite import render_aite_panel
 except Exception:
     render_aite_panel = None
+
+# ── Biological Spike Orchestrator (cold-boot console) ────────────────────────
+try:
+    from ui.spike_orchestrator_panel import render_spike_orchestrator_panel
+except Exception:
+    render_spike_orchestrator_panel = None
 
 # ── Aegis-Quant: situational interceptor + OKF RAG + self-learning ──────────
 # Heavy RAG/embedding stacks stay lazy (session_state). Import failures must
@@ -72,7 +77,7 @@ from ui.charts import ohlc_range_chart, sentiment_gauge_chart
 from ui.news_feed import (
     render_breaking_banner, render_news_ticker, render_impact_panel,
     push_device_notifications, request_notification_permission, render_autorefresh,
-    enable_dig_dive_hotkey, persist_active_tab, tab_unread_badge, status_pill,
+    persist_active_tab, tab_unread_badge, status_pill,
 )
 from data.news_monitor import check_breaking, get_live_feed
 from config import NEWS_REFRESH_SECONDS, GEMINI_API_KEY
@@ -264,7 +269,7 @@ def _check_and_setup_venv():
 
 _check_and_setup_venv()
 
-# ── Tiny on-disk session so the user only goes through DIG & DIVE once ──
+# ── Tiny on-disk session so a refresh skips the boot animation after first entry ──
 _SESSION_FLAG = os.path.join(os.path.dirname(__file__), "db", ".zero_session.json")
 def _load_session_flag():
     try:
@@ -347,8 +352,9 @@ if _should_full and not _show_splash_this_session:
     threading.Thread(target=update_unfulfilled_feedback_logs, daemon=True).start()
 
     st.session_state.last_run_date = now
+    st.session_state.entered = True
     _save_session_flag({
-        'entered': bool(st.session_state.get('entered', False)),
+        'entered': True,
         'matrix': st.session_state.matrix,
         'last_run_date': now.isoformat(),
         'matrix_gen_time': now.isoformat(),
@@ -376,127 +382,28 @@ if st.session_state.entered:
             _toast_signal = True
         except Exception:
             pass
-m = st.session_state.matrix
 
-# Phase 2: Splash Entry Screen (only when the user hasn't entered yet)
+# Phase 2 removed: DIG & DIVE interstitial is skipped after the boot animation.
+# Auto-enter the terminal once the matrix is ready.
+if st.session_state.get('matrix') is None:
+    if isinstance(_persisted.get('matrix'), dict) and _persisted.get('matrix'):
+        st.session_state.matrix = _persisted['matrix']
+    else:
+        st.session_state.matrix = generate_prediction_matrix()
 if not st.session_state.entered:
-    st.markdown("""
-        <style>
-        [data-testid="stAppViewContainer"], .main, body {
-            overflow: hidden !important;
-            background-color: #050505 !important;
-        }
-        [data-testid="stSidebar"] { display: none !important; }
-        
-        .splash-wrapper {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            min-height: 80vh;
-            text-align: center;
-            font-family: 'Inter', system-ui, -apple-system, sans-serif;
-            padding: 20px;
-        }
-        .splash-logo {
-            width: 90px;
-            height: 90px;
-            border-radius: 50%;
-            margin-bottom: 24px;
-            box-shadow: 0 0 35px rgba(229, 9, 20, 0.4);
-            border: 2px solid rgba(229, 9, 20, 0.6);
-            animation: pulse-glow 3s ease-in-out infinite alternate;
-        }
-        @keyframes pulse-glow {
-            0% { transform: scale(0.98); box-shadow: 0 0 25px rgba(229, 9, 20, 0.3); }
-            100% { transform: scale(1.03); box-shadow: 0 0 45px rgba(229, 9, 20, 0.6); }
-        }
-        .splash-title {
-            font-family: 'Orbitron', 'Inter', sans-serif;
-            font-size: 2.8rem;
-            font-weight: 900;
-            letter-spacing: 4px;
-            color: #FFFFFF;
-            margin: 0 0 6px 0;
-            text-transform: uppercase;
-            background: linear-gradient(180deg, #FFFFFF 0%, #A0A0A0 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .splash-subtitle {
-            font-size: 0.95rem;
-            color: #888888;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            margin-bottom: 30px;
-            font-weight: 500;
-        }
-        .splash-status-badge {
-            display: inline-block;
-            color: #E50914;
-            font-size: 0.75rem;
-            font-weight: 700;
-            letter-spacing: 2.5px;
-            text-transform: uppercase;
-            border: 1px solid rgba(229, 9, 20, 0.4);
-            background: rgba(229, 9, 20, 0.05);
-            padding: 8px 20px;
-            border-radius: 4px;
-            margin-bottom: 40px;
-        }
-        div.stButton > button {
-            background: linear-gradient(135deg, #E50914 0%, #B20710 100%) !important;
-            color: #FFFFFF !important;
-            font-weight: 800 !important;
-            font-size: 1rem !important;
-            letter-spacing: 3px !important;
-            padding: 14px 45px !important;
-            border-radius: 4px !important;
-            border: 1px solid #FF1E27 !important;
-            box-shadow: 0 4px 20px rgba(229, 9, 20, 0.4) !important;
-            transition: all 0.25s ease-in-out !important;
-            cursor: pointer !important;
-            width: 100% !important;
-            max-width: 320px !important;
-        }
-        div.stButton > button:hover {
-            transform: translateY(-2px) scale(1.02) !important;
-            box-shadow: 0 6px 28px rgba(229, 9, 20, 0.7) !important;
-            border-color: #FFFFFF !important;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-    
-    with open("ui/assets/logo.png", "rb") as image_file:
-        logo_b64 = base64.b64encode(image_file.read()).decode()
-
-    st.markdown(f"""
-        <div class="splash-wrapper">
-            <img class="splash-logo" src="data:image/png;base64,{logo_b64}" alt="ZERO Core" />
-            <h1 class="splash-title">ZERO V1.0</h1>
-            <p class="splash-subtitle">Adaptive Market Intelligence Terminal</p>
-            <div class="splash-status-badge">⚡ QUANTUM CORES SYNCHRONIZED</div>
-        </div>
-    """, unsafe_allow_html=True)
-
-    col_l, col_m, col_r = st.columns([1, 1, 1])
-    with col_m:
-        if st.button("DIG & DIVE"):
-            st.session_state.entered = True
-            _save_session_flag({
-                'entered': True,
-                'matrix': st.session_state.matrix,
-                'last_run_date': (
-                    st.session_state.last_run_date.isoformat()
-                    if st.session_state.last_run_date else None
-                ),
-                'matrix_gen_time': (
-                    _matrix_gen_time.isoformat() if _matrix_gen_time else now.isoformat()
-                ),
-            })
-            st.rerun()
-    enable_dig_dive_hotkey()
-    st.stop()
+    st.session_state.entered = True
+    _save_session_flag({
+        'entered': True,
+        'matrix': st.session_state.matrix,
+        'last_run_date': (
+            st.session_state.last_run_date.isoformat()
+            if st.session_state.last_run_date else None
+        ),
+        'matrix_gen_time': (
+            _matrix_gen_time.isoformat() if _matrix_gen_time else now.isoformat()
+        ),
+    })
+m = st.session_state.matrix
 
 
 # Phase 3: Main Terminal (Scroll Enabled)
@@ -625,6 +532,7 @@ with st.sidebar:
     if st.button("RECALIBRATE QUANT CORE", width='stretch'):
         st.session_state.matrix = None
         st.session_state.entered = False
+        st.session_state['_splash_shown'] = False
         _save_session_flag({'entered': False})
         st.rerun()
     st.markdown("---")
@@ -725,7 +633,7 @@ cyber_ff(st.session_state.get('news_feed') or m.get('latest_news'))
 st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
 
 # Primary tab console (AEGIS QUANT appended so existing tab indices stay stable)
-tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5, tab_aegis = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY", "AEGIS QUANT"])
+tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5, tab_aegis, tab_spike = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY", "AEGIS QUANT", "SPIKE CORE"])
 
 # UI: remember active tab across auto-refreshes; badge unread breaking items.
 persist_active_tab()
@@ -1737,6 +1645,12 @@ with tab5:
 
 with tab_aegis:
     render_aegis_quant_panel(m)
+
+with tab_spike:
+    if render_spike_orchestrator_panel is not None:
+        render_spike_orchestrator_panel()
+    else:
+        st.caption("Spike orchestrator panel unavailable (ui/spike_orchestrator_panel.py failed to import).")
 
 with tab6:
     _feed = st.session_state.get('news_feed', [])

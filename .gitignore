@@ -32,6 +32,9 @@ db/agent_decisions.jsonl
 db/india_vix_last.json
 db/okf_financial_chroma/
 db/self_learning_quant_weights.json
+db/spike_execution_audit.json
+db/spike_execution_audit.json.lock
+db/spike_execution_audit.json.corrupt
 
 # Local session flags
 .zero_session.json
