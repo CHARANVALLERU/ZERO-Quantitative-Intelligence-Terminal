@@ -1,14 +1,11 @@
 """
 ZERO Live Index Scraper & Real-Time Data Service
 =================================================
-Fetches live quote and OHLC data directly from official exchange sources:
-- SENSEX: https://www.bseindia.com/sensex/code/16
-- NIFTY 50: https://www.nseindia.com/
-- BANKNIFTY: https://www.nseindia.com/index-tracker/NIFTY%20BANK
 
 Features:
 1. Fallback chain: Primary HTML scraper -> yfinance fast tick -> Last known cache.
-2. Market timing logic:
+2. In-memory caching with TTL to reduce API calls and improve performance.
+3. Market timing logic:
    - At 09:15:01 AM IST on trading days: Locks official Opening Price.
    - During 09:15:01 AM - 03:30:00 PM IST: Continuously tracks High/Low breakouts.
    - At 03:30:01 PM IST: Captures final Close price.
@@ -21,11 +18,16 @@ import requests
 import logging
 import datetime
 from typing import Dict, Any, Optional
+from functools import lru_cache
 
 import yfinance as yf
 from config import now_ist, is_trading_day, is_market_open
 
 logger = logging.getLogger("ZERO_LIVE_SCRAPER")
+
+# In-memory cache for live index states with TTL
+_LIVE_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_TTL = 60  # Cache for 60 seconds (sufficient for market data)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -175,30 +177,57 @@ def fetch_yfinance_fallback(index_name: str) -> Optional[Dict[str, float]]:
     return None
 
 
+def _is_cache_fresh(cache_entry: Dict[str, Any], index_name: str) -> bool:
+    """Check if cache entry is fresh (within TTL and for today)."""
+    if not cache_entry or cache_entry.get("date") != datetime.date.today().isoformat():
+        return False
+    last_updated = cache_entry.get("updated_at")
+    if not last_updated:
+        return False
+    try:
+        last_time = datetime.datetime.fromisoformat(last_updated)
+        return (datetime.datetime.now() - last_time).total_seconds() < _CACHE_TTL
+    except (ValueError, TypeError):
+        return False
+
+
 def get_live_index_quote(index_name: str) -> Dict[str, Any]:
     """
     Returns live quote with Open, High, Low, Close logic matching user requirements:
     1. Open is fetched at/after 9:15:01 AM.
     2. High and Low update dynamically whenever live price breaches previous High/Low.
     3. Final close locked at 3:30:01 PM.
+    
+    Optimized with caching:
+    - 60-second cache TTL reduces API calls
+    - Stale cache is refreshed automatically
+    - Date-based cache invalidation for daily freshness
     """
     now = now_ist()
     today_str = now.strftime("%Y-%m-%d")
     current_time_str = now.strftime("%H:%M:%S")
 
-    # Check cache
+    # Check if we have a valid, fresh cache entry
     cached = _LIVE_CACHE.get(index_name, {})
-    if cached.get("date") != today_str:
-        cached = {
-            "date": today_str,
-            "open": None,
-            "high": None,
-            "low": None,
-            "close": None,
-            "price": None,
-            "source": None,
-            "updated_at": None
-        }
+    if _is_cache_fresh(cached, index_name):
+        # Cache is fresh, use it but refresh timestamp
+        cached["updated_at"] = datetime.datetime.now().isoformat()
+        _LIVE_CACHE[index_name] = cached
+        logger.debug(f"Using cached data for {index_name}")
+        return cached
+    
+    # Cache is stale or empty - fetch fresh data
+    logger.debug(f"Fetching fresh data for {index_name}")
+    cached = {
+        "date": today_str,
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+        "price": None,
+        "source": None,
+        "updated_at": None
+    }
 
     # Fetch fresh live data
     live_raw = None

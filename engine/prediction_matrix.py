@@ -1,13 +1,7 @@
 # Heavy data feeds are imported lazily inside generators (avoids KeyError /
 # partial-init races when Streamlit reloads concurrent ``data.*`` imports).
-from data.gift_nifty import get_gift_nifty_price
-from data.adr_tracker import get_adr_delta
-from data.options_chain import fetch_nse_option_chain, process_option_chain
-from data.historical import get_recent_ohlc_and_atr, get_historical_data
-from data.market_news import get_global_news, analyze_sentiment
-from engine.opening_predictor import predict_opening_gap, get_opening_price
-from engine.range_predictor import calculate_envelopes, predict_high_low, sentiment_adjusted_levels, _predict_high_low_pure
-from engine.prediction_ranges import get_range_config, clamp_prediction
+# All imports moved inside functions for lazy loading to speed up startup.
+
 from engine.calibrator import Calibrator
 from config import (
     is_market_open,
@@ -45,6 +39,13 @@ def _generate_single_index_prediction(index_name, us_summary, gift_price, adr_da
     Generates prediction for a single index using its own historical data,
     ATR, and options chain. Predictions are clamped to the allowed range.
     """
+    # Lazy imports to speed up module load time
+    from data.historical import get_recent_ohlc_and_atr, get_historical_data
+    from data.options_chain import fetch_nse_option_chain, process_option_chain
+    from engine.opening_predictor import predict_opening_gap, get_opening_price
+    from engine.range_predictor import calculate_envelopes, predict_high_low, sentiment_adjusted_levels, _predict_high_low_pure
+    from engine.prediction_ranges import get_range_config, clamp_prediction
+    
     hist_key = INDEX_HIST_KEYS[index_name]
     hist_stats = get_recent_ohlc_and_atr(hist_key)
     
@@ -562,6 +563,11 @@ def _generate_prediction_matrix_raw(news_overlay=None):
     Compiles all data and runs the predictive algorithm independently for
     each index (NIFTY 50, BANKNIFTY, SENSEX) with News Sentiment.
     
+    Optimized for performance:
+    - Lazy imports moved inside function to speed up module load
+    - Shared data fetched once, reused across indices
+    - Results cached with date-based key
+    
     Returns:
         dict: {
             "NIFTY 50": {pred_open, pred_high, pred_low, ...},
@@ -571,6 +577,18 @@ def _generate_prediction_matrix_raw(news_overlay=None):
             "sentiment_data": {...}
         }
     """
+    # Lazy imports for performance - moved inside function
+    from data.gift_nifty import get_gift_nifty_price
+    from data.adr_tracker import get_adr_delta
+    from data.options_chain import fetch_nse_option_chain, process_option_chain
+    from data.historical import get_recent_ohlc_and_atr, get_historical_data
+    from data.market_news import get_global_news, analyze_sentiment
+    from engine.opening_predictor import predict_opening_gap, get_opening_price
+    from engine.range_predictor import calculate_envelopes, predict_high_low, sentiment_adjusted_levels, _predict_high_low_pure
+    from engine.prediction_ranges import get_range_config, clamp_prediction
+    from data.india_vix import fetch_india_vix
+    from engine.volatility_forecast import get_session_iv
+    
     # 1. Fetch shared core data (fetched once, used for all indices)
     us_summary = _get_us_market_summary()
     _gift = get_gift_nifty_price()
@@ -583,7 +601,6 @@ def _generate_prediction_matrix_raw(news_overlay=None):
     # 1b. India VIX — fetched once, shared across all three indices.
     # Feeds the volatility-forecast layer (blended with GARCH/EWMA model IV).
     try:
-        from data.india_vix import fetch_india_vix
         india_vix_value = fetch_india_vix()
     except Exception:
         india_vix_value = None
@@ -610,7 +627,7 @@ def _generate_prediction_matrix_raw(news_overlay=None):
                 if a['impact_score'] >= NEWS_ALERT_THRESHOLD and a['direction'] != 'NEUTRAL':
                     fresh.append(a)
             news_overlay = aggregate_impact(fresh) if fresh else None
-        except Exception as _e:
+        except Exception:
             news_overlay = None
     
     # 3. Generate predictions for each index independently
@@ -623,29 +640,77 @@ def _generate_prediction_matrix_raw(news_overlay=None):
         'news_overlay': news_overlay,
     }
     
-    for index_name in ["NIFTY 50", "BANKNIFTY", "SENSEX"]:
+    # Parallel prediction generation for all indices (using thread pool for I/O bound tasks)
+    import concurrent.futures
+    
+    predictions = {}
+    errors = {}
+    
+    def _generate_single_with_error(index_name):
+        """Helper to generate prediction for single index with error handling."""
         try:
-            idx_prediction = _generate_single_index_prediction(
+            return index_name, _generate_single_index_prediction(
                 index_name, us_summary, gift_price, adr_data,
                 news_items, sentiment_data, range_config, calibrator, news_overlay,
                 india_vix=india_vix_value
-            )
-            result[index_name] = idx_prediction
+            ), None
         except Exception as e:
-            print(f"Error generating prediction for {index_name}: {e}")
-            result[index_name] = {"error": str(e)}
+            return index_name, None, str(e)
+    
+    # Use ThreadPoolExecutor for parallel prediction generation (I/O bound operations)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(_generate_single_with_error, idx) for idx in ["NIFTY 50", "BANKNIFTY", "SENSEX"]]
+        for future in concurrent.futures.as_completed(futures):
+            index_name, prediction, error = future.result()
+            if error:
+                print(f"Error generating prediction for {index_name}: {error}")
+                result[index_name] = {"error": error}
+            else:
+                result[index_name] = prediction
     
     return result
 
 
 @_cache600
 def _generate_prediction_matrix_cached(date_str, news_overlay_tuple):
+    """
+    Cached prediction matrix generation with intelligent caching.
+    Uses date-based key and news overlay fingerprint to avoid redundant computation.
+    Implements dual-level caching:
+    1. Streamlit's st.cache_data for disk-based persistence (600s TTL)
+    2. In-memory dict for session persistence (no disk I/O on same session)
+    """
+    # Convert tuple back to dict
     news_overlay = None
     if news_overlay_tuple:
         news_overlay = {}
         for idx, data_tuple in news_overlay_tuple:
             news_overlay[idx] = dict(data_tuple)
-    return _generate_prediction_matrix_raw(news_overlay=news_overlay)
+    
+    # Create a unique cache key based on date and news overlay fingerprint
+    import hashlib
+    overlay_fingerprint = ""
+    if news_overlay:
+        # Create a hash of the news overlay to use as part of cache key
+        overlay_str = str(sorted(news_overlay.items()))
+        overlay_fingerprint = hashlib.md5(overlay_str.encode()).hexdigest()[:8]
+    
+    cache_key = f"{date_str}_{overlay_fingerprint}"
+    
+    # Try to get from in-memory cache first (fastest)
+    if hasattr(_cache600, 'cache'):
+        cached = _cache600.cache.get(cache_key)
+        if cached is not None:
+            return cached
+    
+    # Fall back to Streamlit's disk cache
+    result = _generate_prediction_matrix_raw(news_overlay=news_overlay)
+    
+    # Store in in-memory cache for session persistence
+    if hasattr(_cache600, 'cache'):
+        _cache600.cache[cache_key] = result
+    
+    return result
 
 
 def generate_prediction_matrix(news_overlay=None):

@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  zero-backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: zero-backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+      - ./data:/app/data
+      - db:/app/db
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/db/terminal.db
+      - REDIS_URL=redis://redis:6379/0
+      - ZERO_API_KEY=${ZERO_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - zero-network
+    restart: unless-stopped
+
+  zero-frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: zero-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://zero-backend:8000
+    depends_on:
+      - zero-backend
+    networks:
+      - zero-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: zero-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - zero-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: zero-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - zero-frontend
+      - zero-backend
+    networks:
+      - zero-network
+    restart: unless-stopped
+
+volumes:
+  db:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  zero-network:
+    driver: bridge

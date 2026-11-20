@@ -1,0 +1,101 @@
+{
+  "timestamp": "2026-09-17T22:43:58.004048",
+  "total_components": 10,
+  "passed": 4,
+  "failed": 1,
+  "warnings": 5,
+  "results": [
+    {
+      "component": "API Health Endpoint",
+      "status": "WARN",
+      "message": "Endpoint not running or error: [WinError 10061] No connection could be made because the target machine actively refused it",
+      "duration": 0.0,
+      "details": {}
+    },
+    {
+      "component": "Predictions API",
+      "status": "WARN",
+      "message": "Not available or error: [WinError 10061] No connection could be made because the target machine actively refused it",
+      "duration": 0.0,
+      "details": {}
+    },
+    {
+      "component": "Live Prices API",
+      "status": "WARN",
+      "message": "Not available or error: [WinError 10061] No connection could be made because the target machine actively refused it",
+      "duration": 0.0,
+      "details": {}
+    },
+    {
+      "component": "News API",
+      "status": "WARN",
+      "message": "Not available or error: [WinError 10061] No connection could be made because the target machine actively refused it",
+      "duration": 0.0,
+      "details": {}
+    },
+    {
+      "component": "WebSocket Endpoint",
+      "status": "WARN",
+      "message": "Error checking WebSocket: [WinError 10061] No connection could be made because the target machine actively refused it",
+      "duration": 0.0,
+      "details": {}
+    },
+    {
+      "component": "Database",
+      "status": "PASS",
+      "message": "Database operations successful",
+      "duration": 0.0,
+      "details": {
+        "tables": [
+          "id",
+          "email",
+          "username",
+          "hashed_password",
+          "is_active"
+        ]
+      }
+    },
+    {
+      "component": "Cache",
+      "status": "FAIL",
+      "message": "Cache get returned wrong data",
+      "duration": 0.0,
+      "details": {}
+    },
+    {
+      "component": "Cache Key Generation",
+      "status": "PASS",
+      "message": "Cache keys generated correctly",
+      "duration": 0.0,
+      "details": {
+        "keys": [
+          "predictions:NIFTY 50",
+          "prices:live",
+          "news:limit=20"
+        ]
+      }
+    },
+    {
+      "component": "Validation",
+      "status": "PASS",
+      "message": "Order validation working",
+      "duration": 0.0,
+      "details": {
+        "valid_orders": 0,
+        "invalid_orders": 0
+      }
+    },
+    {
+      "component": "Validation",
+      "status": "PASS",
+      "message": "Prediction validation working",
+      "duration": 0.0,
+      "details": {}
+    }
+  ],
+  "summary": "Verification completed with 4 passed, 1 failed, and 5 warnings. Total components tested: 10",
+  "recommendations": [
+    "Review failed tests and fix implementation issues",
+    "Review warnings and optimize if needed"
+  ]
+}

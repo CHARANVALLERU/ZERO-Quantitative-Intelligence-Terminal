@@ -57,3 +57,24 @@ obsidian_vault/01_Daily_Logs/
 Thumbs.db
 .idea/
 .vscode/
+
+# Node
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+frontend/.cache/
+
+# Docker
+Dockerfile*.dev
+docker-compose.*.local
+docker-compose.dev.yml
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+Jenkinsfile
+
+# Composer/PHP
+composer.lock
+vendor/

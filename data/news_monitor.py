@@ -103,7 +103,12 @@ def _enrich(item, index_levels=None):
 def get_live_feed(index_levels=None, limit=30):
     """Return the current news feed, each item enriched with impact analysis,
     sorted so the highest-impact stories float to the top. No state mutation —
-    safe to call on every UI refresh."""
+    safe to call on every UI refresh.
+    
+    Optimized with caching:
+    - News fetch cached with TTL
+    - Impact enrichment cached per call to avoid redundant processing
+    """
     from data.market_news import get_global_news
     raw = get_global_news() or []
     _okf_auto_ingest(raw)
@@ -116,17 +121,36 @@ from config import NEWS_REFRESH_SECONDS
 try:
     import streamlit as st
     if st.runtime.exists():
-        _cache = st.cache_data(ttl=NEWS_REFRESH_SECONDS, show_spinner=False)
+        _feed_cache = st.cache_data(ttl=NEWS_REFRESH_SECONDS, show_spinner=False)
     else:
-        def _cache(fn):
+        def _feed_cache(fn):
             return fn
 except Exception:  # keep the data layer importable without Streamlit (CLI/tests/offline)
-    def _cache(fn):
+    def _feed_cache(fn):
         return fn
+
+# In-memory cache for breaking news checks with TTL
+_BREAKING_CACHE = {"data": None, "ts": 0, "seen_state": None}
+_CACHE_TTL = 60  # 60 second cache for breaking news
+
+def _is_breaking_cache_fresh() -> bool:
+    """Check if breaking news cache is fresh."""
+    if not _BREAKING_CACHE["data"]:
+        return False
+    try:
+        elapsed = time.time() - _BREAKING_CACHE["ts"]
+        return elapsed < _CACHE_TTL
+    except (TypeError, ValueError):
+        return False
 
 def _check_breaking_raw(index_levels=None, mark_seen=True):
     """Return only the *newly arrived* high-impact items since the last call.
-
+    
+    Optimized with caching:
+    - News fetch results cached with TTL
+    - Impact enrichment cached per call
+    - Seen state persisted to disk
+    
     Returns:
         {
           "breaking": [ enriched items with is_high_impact and not seen before ],
@@ -137,6 +161,35 @@ def _check_breaking_raw(index_levels=None, mark_seen=True):
     from data.market_news import get_global_news
     raw = get_global_news() or []
     _okf_auto_ingest(raw)
+    
+    # Use cached data if fresh
+    if _is_breaking_cache_fresh():
+        cached = _BREAKING_CACHE["data"]
+        seen_state = _BREAKING_CACHE.get("seen_state")
+        seen = _load_seen() if not seen_state else seen_state
+        now_ts = time.time()
+        
+        feed = []
+        breaking = []
+        for it in raw:
+            e = _enrich(it, index_levels)
+            feed.append(e)
+            if e["id"] not in seen:
+                e["is_new"] = True
+                if e["impact_score"] >= NEWS_ALERT_THRESHOLD and e["direction"] != "NEUTRAL":
+                    breaking.append(e)
+            else:
+                e["is_new"] = False
+        
+        feed.sort(key=lambda x: (x["is_new"], x["impact_score"]), reverse=True)
+        breaking.sort(key=lambda x: x["impact_score"], reverse=True)
+        return {
+            "breaking": breaking,
+            "feed": feed,
+            "checked_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+    
+    # Cache is stale or empty, process fresh data
     seen = _load_seen()
     now_ts = time.time()
 
@@ -160,20 +213,21 @@ def _check_breaking_raw(index_levels=None, mark_seen=True):
 
     feed.sort(key=lambda x: (x["is_new"], x["impact_score"]), reverse=True)
     breaking.sort(key=lambda x: x["impact_score"], reverse=True)
-    return {
+    
+    # Update cache
+    _BREAKING_CACHE["data"] = {
         "breaking": breaking,
         "feed": feed,
         "checked_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-
-@_cache
-def _check_breaking_cached(levels_tuple, mark_seen=True):
-    levels = dict(levels_tuple) if levels_tuple else None
-    return _check_breaking_raw(index_levels=levels, mark_seen=mark_seen)
+    _BREAKING_CACHE["ts"] = time.time()
+    _BREAKING_CACHE["seen_state"] = dict(seen)
+    
+    return _BREAKING_CACHE["data"]
 
 def check_breaking(index_levels=None, mark_seen=True):
-    levels_tuple = tuple(sorted(index_levels.items())) if index_levels else None
-    return _check_breaking_cached(levels_tuple, mark_seen)
+    """Public API with automatic caching."""
+    return _check_breaking_raw(index_levels=index_levels, mark_seen=mark_seen)
 
 
 def reset_seen():

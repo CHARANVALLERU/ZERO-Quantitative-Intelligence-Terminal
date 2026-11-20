@@ -5,7 +5,20 @@ ZERO Time-Series Foundation Model (TSFM) Predictor
 OPTIONAL third ensemble leg for ZERO's daily OHLC envelope stack
 (geometric ATR-envelope + adaptive calibrator + XGBoost).  Provides a
 probabilistic close forecast (P10/P50/P90) plus a high/low envelope from a
-time-series foundation model:
+time-series foundation model.
+
+Optimized with caching:
+- Model weights cached at module level after first load
+- Backend resolution cached to avoid repeated probing
+- Forecast results cached with TTL for repeated calls with same input
+""
+
+from functools import lru_cache
+import hashlib
+
+# TSFM Forecast Cache
+_TSFM_FORECAST_CACHE = {}
+_FORECAST_CACHE_TTL = 300  # 5 minutes cache for forecast results
 
     1. chronos2  — Amazon Chronos-2 (covariate-informed; preferred)
     2. kronos    — Kronos finance K-line foundation model (HF + local repo)
@@ -461,9 +474,39 @@ class TSFMForecaster:
             self._last_error = f"{backend}: {exc}"
             return False
 
+    def _generate_cache_key(self, hist_df, horizon, covariates) -> str:
+        """Generate a unique cache key for forecast results."""
+        # Convert dataframe to hashable representation
+        try:
+            df_hash = hashlib.md5(pd.util.hash_pandas_object(hist_df).values.tobytes()).hexdigest()
+        except Exception:
+            df_hash = str(hist_df.shape)
+        
+        cov_hash = ""
+        if covariates:
+            cov_hash = hashlib.md5(str(sorted(covariates.items())).encode()).hexdigest()[:8]
+        
+        return f"{df_hash}_{horizon}_{cov_hash}_{self.backend}"
+    
+    def _is_cache_fresh(self, cache_key: str) -> bool:
+        """Check if forecast cache is fresh."""
+        if cache_key not in _TSFM_FORECAST_CACHE:
+            return False
+        cache_entry = _TSFM_FORECAST_CACHE[cache_key]
+        try:
+            elapsed = time.time() - cache_entry["ts"]
+            return elapsed < _FORECAST_CACHE_TTL
+        except (TypeError, ValueError):
+            return False
+
     def forecast_ohlc(self, hist_df: pd.DataFrame, horizon: int = 1,
                       covariates: dict | None = None) -> dict:
         """Probabilistic OHLC envelope from the first available TSFM backend.
+
+        Optimized with caching:
+        - Forecast results cached with TTL (5 minutes)
+        - Cache key based on input hash to avoid collisions
+        - Warm path uses cached backend to avoid re-probing
 
         hist_df: columns open/high/low/close (+optional volume), most-recent
         LAST.  Capitalized yfinance columns and MultiIndex columns are also
@@ -477,6 +520,11 @@ class TSFMForecaster:
 
         Returns the schema documented in the module docstring; NEVER raises.
         """
+        # Check cache first
+        cache_key = self._generate_cache_key(hist_df, horizon, covariates)
+        if self._is_cache_fresh(cache_key):
+            return _TSFM_FORECAST_CACHE[cache_key]["result"]
+        
         try:
             horizon = max(1, int(horizon))
         except Exception:
@@ -485,12 +533,16 @@ class TSFMForecaster:
             df = self._normalize_hist(hist_df)
             if df is None or len(df) < TSFM_MIN_CONTEXT:
                 n = 0 if df is None else len(df)
-                return self._result("error", None, horizon, n,
+                result = self._result("error", None, horizon, n,
                                     error=f"insufficient context ({n} < {TSFM_MIN_CONTEXT})")
+                _TSFM_FORECAST_CACHE[cache_key] = {"ts": time.time(), "result": result}
+                return result
 
             candidates = self._candidate_backends()
             if not candidates:
-                return self._result("unavailable", None, horizon, len(df))
+                result = self._result("unavailable", None, horizon, len(df))
+                _TSFM_FORECAST_CACHE[cache_key] = {"ts": time.time(), "result": result}
+                return result
 
             # Prefer a previously resolved backend first (warm path), then the
             # rest of the auto chain. Pinned backends stay singleton.
@@ -503,6 +555,7 @@ class TSFMForecaster:
 
             last_error = self._last_error
             allow_fallback = self.backend == "auto"
+            result = None
             for backend in ordered:
                 if not self._try_load_backend(backend):
                     continue
@@ -531,13 +584,14 @@ class TSFMForecaster:
 
                     last_close = float(ctx["close"].iloc[-1])
                     self._resolved = backend
-                    return self._result(
+                    result = self._result(
                         "forecasted", backend, horizon, len(ctx),
                         close={"p10": _r(p10), "p50": _r(p50), "p90": _r(p90)},
                         high_p90=_r(high_p90), low_p10=_r(low_p10),
                         direction=self._direction(p50, last_close),
                         last_close=_r(last_close),
                     )
+                    break
                 except Exception as exc:
                     last_error = f"{backend}: {exc}"
                     self._last_error = last_error
@@ -545,12 +599,20 @@ class TSFMForecaster:
                         break
                     continue
 
-            if last_error:
-                return self._result("error", None, horizon, len(df), error=last_error)
-            return self._result("unavailable", None, horizon, len(df))
+            if result is None:
+                if last_error:
+                    result = self._result("error", None, horizon, len(df), error=last_error)
+                else:
+                    result = self._result("unavailable", None, horizon, len(df))
+            
+            # Store in cache
+            _TSFM_FORECAST_CACHE[cache_key] = {"ts": time.time(), "result": result}
+            return result
         except Exception as exc:  # absolute no-raise guarantee
             backend = self._resolved if self._resolved not in (None, "none") else None
-            return self._result("error", backend, horizon, 0, error=str(exc))
+            result = self._result("error", backend, horizon, 0, error=str(exc))
+            _TSFM_FORECAST_CACHE[cache_key] = {"ts": time.time(), "result": result}
+            return result
 
     def compare_vs_point(self, forecast: dict, point_pred: dict) -> dict:
         """Compare a TSFM interval forecast with ZERO's point prediction
