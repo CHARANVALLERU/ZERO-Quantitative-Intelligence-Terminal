@@ -33,6 +33,13 @@ try:
 except Exception:
     render_aite_panel = None
 
+# ── ZERO ENGINE v2.0 — macro graph, aggregation, structure, strategy lab, MCP ─
+try:
+    from ui.v2_panel import render_v2_panel, maybe_render_brief
+except Exception:
+    render_v2_panel = None
+    maybe_render_brief = None
+
 # ── Biological Spike Orchestrator (cold-boot console) ────────────────────────
 try:
     from ui.spike_orchestrator_panel import render_spike_orchestrator_panel
@@ -599,6 +606,13 @@ if st.session_state.get('show_zero_agi', False):
 st.markdown("<h1 class='main-title'>ZERO</h1>", unsafe_allow_html=True)
 st.markdown("<p class='terminal-core-txt'>TERMINAL CORE SYSTEM V2.0</p>", unsafe_allow_html=True)
 
+# v2.0 daily admin brief: once-per-day toast + strategies-folder navigator.
+if maybe_render_brief is not None:
+    try:
+        maybe_render_brief()
+    except Exception:
+        pass
+
 # Background-refresh toast: a 2s translucent bubble that slides down and
 # retracts. Fires only on the run that actually regenerated the matrix.
 if _toast_signal:
@@ -633,7 +647,7 @@ cyber_ff(st.session_state.get('news_feed') or m.get('latest_news'))
 st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
 
 # Primary tab console (AEGIS QUANT appended so existing tab indices stay stable)
-tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5, tab_aegis, tab_spike = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY", "AEGIS QUANT", "SPIKE CORE"])
+tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5, tab_aegis, tab_spike, tab_v2 = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY", "AEGIS QUANT", "SPIKE CORE", "ZERO ENGINE v2.0"])
 
 # UI: remember active tab across auto-refreshes; badge unread breaking items.
 persist_active_tab()
@@ -1651,6 +1665,12 @@ with tab_spike:
         render_spike_orchestrator_panel()
     else:
         st.caption("Spike orchestrator panel unavailable (ui/spike_orchestrator_panel.py failed to import).")
+
+with tab_v2:
+    if render_v2_panel is not None:
+        render_v2_panel(m)
+    else:
+        st.caption("ZERO Engine v2.0 panel unavailable (ui/v2_panel.py failed to import).")
 
 with tab6:
     _feed = st.session_state.get('news_feed', [])

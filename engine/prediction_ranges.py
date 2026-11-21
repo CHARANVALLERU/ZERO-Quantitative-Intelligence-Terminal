@@ -97,15 +97,18 @@ def get_range_config(force_refresh=False):
     if force_refresh or _is_config_stale(config):
         # Refresh from live data
         prices = get_current_prices()
+        previous = _load_range_config()
+        live_hits = 0
         config = {"last_updated": datetime.datetime.now().isoformat()}
         
         for idx_name, max_range in MAX_PREDICTION_RANGE.items():
             center = prices.get(idx_name)
+            if center is not None:
+                live_hits += 1
             if center is None:
                 # Fallback: use previous config if available, or hardcoded defaults
-                old_config = _load_range_config()
-                if old_config and idx_name in old_config:
-                    center = old_config[idx_name]['center']
+                if previous and idx_name in previous:
+                    center = previous[idx_name]['center']
                 else:
                     # Emergency defaults
                     center = {"NIFTY 50": 24000, "BANKNIFTY": 58000, "SENSEX": 78000}[idx_name]
@@ -116,6 +119,14 @@ def get_range_config(force_refresh=False):
                 "max_high": round(center + max_range, 2),
                 "max_low": round(center - max_range, 2)
             }
+
+        # Never claim freshness when no live price was obtained: stamping a
+        # recycled centre as "today" is how an 84-day-old config stayed hidden.
+        if live_hits == 0:
+            config["last_updated"] = (previous or {}).get("last_updated")
+            config["stale"] = True
+        else:
+            config["stale"] = False
         
         _save_range_config(config)
     

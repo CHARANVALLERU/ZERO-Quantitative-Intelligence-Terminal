@@ -557,6 +557,12 @@ except Exception:  # importable for CLI / tests / offline without Streamlit
     def _cache600(fn):
         return fn
 
+# Process-local level-1 cache. st.cache_data exposes no mutable ``.cache``
+# attribute, so the previous hasattr() guard was dead code (it never stored
+# anything). A bounded dict is the honest implementation of that intent.
+_MEM_CACHE: dict = {}
+_MEM_CACHE_MAX = 8
+
 
 def _generate_prediction_matrix_raw(news_overlay=None):
     """
@@ -667,7 +673,17 @@ def _generate_prediction_matrix_raw(news_overlay=None):
                 result[index_name] = {"error": error}
             else:
                 result[index_name] = prediction
-    
+
+    # 4. v2.0 macro factor-graph overlay. Attaches the full analysis block and,
+    #    when confidence clears the gate, tilts open/close/high/low inside the
+    #    per-index clamp. Never raises: a failure attaches an error block and
+    #    leaves the core prediction untouched.
+    try:
+        from engine.v2.macro_factors import apply_macro_overlay
+        result = apply_macro_overlay(result)
+    except Exception as _macro_exc:  # noqa: BLE001 - degradation is intentional
+        result['macro'] = {'schema': '2.0', 'apply': False, 'error': str(_macro_exc)[:200]}
+
     return result
 
 
@@ -697,18 +713,17 @@ def _generate_prediction_matrix_cached(date_str, news_overlay_tuple):
     
     cache_key = f"{date_str}_{overlay_fingerprint}"
     
-    # Try to get from in-memory cache first (fastest)
-    if hasattr(_cache600, 'cache'):
-        cached = _cache600.cache.get(cache_key)
-        if cached is not None:
-            return cached
+    # Level 1: process-local cache (fastest, survives st.cache_data eviction).
+    cached = _MEM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     
-    # Fall back to Streamlit's disk cache
+    # Level 2: the full prediction run.
     result = _generate_prediction_matrix_raw(news_overlay=news_overlay)
     
-    # Store in in-memory cache for session persistence
-    if hasattr(_cache600, 'cache'):
-        _cache600.cache[cache_key] = result
+    if len(_MEM_CACHE) >= _MEM_CACHE_MAX:
+        _MEM_CACHE.pop(next(iter(_MEM_CACHE)))
+    _MEM_CACHE[cache_key] = result
     
     return result
 

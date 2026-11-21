@@ -1,0 +1,36 @@
+# ZERO Terminal — Next.js frontend image
+# Build from the repository root:
+#   docker build -f docker/Dockerfile.frontend -t zero-frontend .
+#
+# frontend/next.config.js sets `output: 'standalone'`, so the runtime stage must
+# run the generated server.js — `next start` is not supported in that mode.
+FROM node:20-alpine AS deps
+WORKDIR /app
+# No lockfile is committed yet; `npm ci` needs one, so fall back to `npm install`.
+COPY frontend/package.json ./
+RUN npm install --no-audit --no-fund
+
+FROM node:20-alpine AS build
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY --from=deps /app/node_modules ./node_modules
+COPY frontend/ ./
+# `public/` is optional in this repo; create it so the build is deterministic.
+RUN mkdir -p public
+# Baked into the client bundle at build time.
+ARG NEXT_PUBLIC_API_URL=http://localhost:8000
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+RUN npm run build
+
+FROM node:20-alpine AS run
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+# Standalone bundle + static assets, laid out exactly as server.js expects.
+COPY --from=build /app/public ./public
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+EXPOSE 3000
+CMD ["node", "server.js"]

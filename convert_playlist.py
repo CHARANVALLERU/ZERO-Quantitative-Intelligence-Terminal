@@ -664,7 +664,8 @@ def process_youtube_conversion(url, output_file=DEFAULT_OUTPUT, auto_ingest=True
         except Exception as ve:
             print(f"vault_sync notice: {ve}")
 
-        index_file = os.path.join(obsidian_yt_dir, "Index.md")        if os.path.exists(index_file):
+        index_file = os.path.join(obsidian_yt_dir, "Index.md")
+        if os.path.exists(index_file):
             try:
                 with open(index_file, "r", encoding="utf-8") as f:
                     idx_content = f.read()

@@ -231,10 +231,15 @@ def check_breaking(index_levels=None, mark_seen=True):
 
 
 def reset_seen():
-    """Forget all seen headlines (e.g. on a manual 'replay alerts')."""
+    """Forget all seen headlines (e.g. on a manual 'replay alerts').
+
+    Also invalidates the in-process breaking cache, so the next
+    ``check_breaking()`` call reprocesses the feed against the empty seen-set.
+    """
     _save_seen({})
-    if hasattr(_check_breaking_cached, "clear"):
-        _check_breaking_cached.clear()
+    _BREAKING_CACHE["data"] = None
+    _BREAKING_CACHE["ts"] = 0.0
+    _BREAKING_CACHE["seen_state"] = {}
 
 
 if __name__ == "__main__":

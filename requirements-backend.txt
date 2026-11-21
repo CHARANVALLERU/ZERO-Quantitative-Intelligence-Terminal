@@ -1,0 +1,17 @@
+# ZERO Terminal — FastAPI backend dependencies.
+# Deliberately separate from requirements.txt: the backend image must not pull
+# the Streamlit/torch/RAG stack. Installed by docker/Dockerfile.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.6
+pydantic-settings>=2.2
+python-multipart>=0.0.9
+SQLAlchemy>=2.0
+aiosqlite>=0.19
+redis>=5.0
+slowapi>=0.1.9
+python-jose[cryptography]>=3.3
+passlib[bcrypt]>=1.7
+httpx>=0.27
+numpy>=1.26
+pandas>=2.0

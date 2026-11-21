@@ -455,9 +455,23 @@ class Calibrator:
 
     @classmethod
     def load_or_baseline(cls):
-        """Always return a usable Calibrator. If none is saved, return an
-        empty one whose `apply` is an identity pass-through (baseline)."""
-        return cls.load() or cls()
+        """Always return a usable Calibrator.
+
+        Returns an identity pass-through (baseline) when nothing is saved OR
+        when the saved model is older than ``ML_STALE_DAYS``. A stale
+        correction is worse than none: it applies month-old market structure
+        to today's tape, and the engine already reports "calibrated" either
+        way, which hid the problem.
+        """
+        model = cls.load()
+        if model is None:
+            return cls()
+        try:
+            if model.is_stale():
+                return cls()
+        except Exception:
+            return cls()
+        return model
 
 
 def _z_to_quantile(z):

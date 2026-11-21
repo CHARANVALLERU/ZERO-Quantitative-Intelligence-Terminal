@@ -1,0 +1,13 @@
+{
+  "schema": "2.0",
+  "servers": {
+    "rea": {
+      "command": "npx",
+      "args": ["-y", "rea-agents@6.10.1", "mcp"],
+      "enabled": true,
+      "auto_start": false,
+      "purpose": "Reverse-engineering MCP: inspect binaries, Electron/JS bundles, HTTP APIs and native UI.",
+      "notes": "Set enabled=false to keep the engine fully offline. Probe on demand from the v2.0 panel."
+    }
+  }
+}

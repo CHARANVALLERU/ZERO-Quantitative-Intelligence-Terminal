@@ -193,21 +193,44 @@ def log_daily_feedback(prediction_data, actual_data=None, reason="", target_date
         print(f"Error logging feedback: {e}")
         return False
 
+def _finite_json(obj):
+    """Recursively replace NaN/Infinity with None.
+
+    Python's json module happily parses and writes bare ``NaN``/``Infinity``,
+    which are not valid JSON and poison every downstream consumer (a NaN leg
+    silently turns accuracy and calibration maths into NaN). This is the single
+    boundary where that is fixed.
+    """
+    import math
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite_json(v) for v in obj]
+    return obj
+
+
 def get_feedback_logs():
-    """Returns all logged feedback."""
+    """Returns all logged feedback, with non-finite floats normalized to None."""
     if not os.path.exists(FEEDBACK_FILE) or os.path.getsize(FEEDBACK_FILE) == 0:
         return []
     try:
         with open(FEEDBACK_FILE, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
     except json.JSONDecodeError:
         return []
+    return _finite_json(data) if isinstance(data, list) else []
 
 def update_feedback_logs(new_logs):
-    """Overwrite the feedback_log.json with new list of logs from the editor."""
+    """Overwrite the feedback_log.json with new list of logs from the editor.
+
+    Writes strict JSON (``allow_nan=False``) so an invalid number can never
+    reach disk again.
+    """
     try:
         with open(FEEDBACK_FILE, 'w') as f:
-            json.dump(new_logs, f, indent=4)
+            json.dump(_finite_json(new_logs), f, indent=4, allow_nan=False)
         return True
     except Exception as e:
         print(f"Error updating logs: {e}")
@@ -297,9 +320,17 @@ def calculate_engine_accuracy():
             if not isinstance(a, dict) or str(a.get('open')) == "N/A" or not a.get('open') or float(a.get('open')) <= 0:
                 continue
                 
-            p_open = p.get('pred_open', 0)
-            p_high = p.get('pred_high', 0)
-            p_low = p.get('pred_low', 0)
+            # A missing or non-finite predicted leg must skip the entry, never
+            # enter the average as NaN/None. Older logs contain such rows.
+            import math
+            try:
+                p_open = float(p.get('pred_open'))
+                p_high = float(p.get('pred_high'))
+                p_low = float(p.get('pred_low'))
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) and v > 0 for v in (p_open, p_high, p_low)):
+                continue
             
             a_open = float(a.get('open', 0))
             a_high = float(a.get('high', 0))

@@ -1,0 +1,24 @@
+{
+  "schema": "2.0",
+  "updated_at": "2026-11-21T00:00:00",
+  "cpi_target_pct": 4.0,
+  "cpi_target_pct_source": "RBI flexible inflation-targeting midpoint (4% +/- 2%)",
+  "cpi_yoy_pct": 6.09,
+  "cpi_yoy_pct_source": "India CPI Oct 2026 (Trading Economics / MoSPI release)",
+  "nifty_cagr_pct": 10.1,
+  "nifty_cagr_pct_source": "15-year Nifty 50 CAGR (user-supplied research)",
+  "sensex_cagr_pct": 10.5,
+  "sensex_cagr_pct_source": "15-year Sensex CAGR (user-supplied research)",
+  "repo_rate_pct": null,
+  "fed_funds_pct": null,
+  "supply_gap_pct": null,
+  "earnings_growth_pct": null,
+  "acquisition_score": 0.0,
+  "policy_tone": 0.0,
+  "insider_tone": 0.0,
+  "notes": [
+    "Only sourced values are pre-filled. Null means not observed; the graph reduces confidence instead of guessing.",
+    "Update repo_rate_pct, supply_gap_pct and earnings_growth_pct here (or from the v2.0 panel) when you have a source.",
+    "acquisition_score / policy_tone / insider_tone are -1..1 event scores written by the aggregator or a human."
+  ]
+}
