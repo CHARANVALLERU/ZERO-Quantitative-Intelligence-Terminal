@@ -77,7 +77,7 @@ US_FUT_TICKERS = ('^GSPC', '^IXIC', '^DJI')
 
 # Coefficients (Initial calibration — kept for backward compatibility)
 ALPHA = 0.5  # GIFT Nifty weight
-BETA = 0.5   # ADR weight
+BETA = 0.0   # ADR weight
 GAMMA = 0.5  # Volatility multiplier
 
 # Extended cross-asset weights (linear fallback used when ML model is absent)
