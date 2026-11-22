@@ -149,30 +149,61 @@ def test_structure_handles_no_data():
 # ── Strategy lab ────────────────────────────────────────────────────────────
 
 def test_strategy_name_is_alphanumeric():
-    name = strategy_lab.make_name("MOM", "NIFTY", {"lookback": 20})
-    assert name.startswith("Z2-MOM-")
+    name = strategy_lab.make_name("BREAKOUT", "NIFTY", {"lookback": 20})
+    assert name.startswith("Z2-BREAKOUT-")
     assert name.replace("-", "").isalnum()
+
+
+def test_gate_constants_are_not_loosened():
+    assert strategy_lab.MIN_TRADES_TO_PASS == 20
+    assert strategy_lab.MIN_PROFIT_FACTOR == 1.15
+    assert strategy_lab.MAX_DRAWDOWN_PCT == 12.0
 
 
 def test_backtest_produces_finite_metrics():
     df = _frame(500, seed=11, drift=0.0010)
     spec = strategy_lab._describe(strategy_lab.StrategySpec(
-        family="MOM", index_key="NIFTY",
-        params={"lookback": 20, "trend": 100, "exit_lookback": 10,
-                "stop_atr": 1.5, "target_r": 2.0, "time_stop": 20},
+        family="BREAKOUT", index_key="NIFTY",
+        params={"lookback": 20, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
     ))
     result = strategy_lab.backtest(df, spec)
     m = result["metrics"]
     assert m["trades"] >= 1
     for key in ("net_pnl", "profit_factor", "max_drawdown_pct", "expectancy_r"):
         assert math.isfinite(float(m[key])), key
-    # Every trade must carry a stop below entry (long-only risk control).
+    # Every trade must carry a stop on the losing side of entry.
     for trade in result["trades"]:
-        assert trade["stop"] < trade["entry"]
+        if trade.get("side", "LONG") == "LONG":
+            assert trade["stop"] < trade["entry"]
+        else:
+            assert trade["stop"] > trade["entry"]
     doc = strategy_lab.render_strategy_doc(spec, result)
     mistakes = strategy_lab.render_mistakes_doc(spec, result)
     assert spec.name in doc and "Risk:" in doc
     assert spec.name in mistakes and "P&L" in mistakes
+
+
+def test_index_strategies_are_long_only_by_default():
+    df = _frame(500, seed=7, drift=0.0008)
+    spec = strategy_lab._describe(strategy_lab.StrategySpec(
+        family="BREAKOUT", index_key="NIFTY", params={"lookback": 20},
+    ))
+    assert spec.params["direction_mode"] == "long"
+    result = strategy_lab.backtest(df, spec)
+    assert all(t["side"] == "LONG" for t in result["trades"])
+
+
+def test_walk_forward_and_validation_shape():
+    df = _frame(1200, seed=3, drift=0.0008)
+    spec = strategy_lab._describe(strategy_lab.StrategySpec(
+        family="BREAKOUT", index_key="NIFTY", params={"lookback": 20},
+    ))
+    wf = strategy_lab.walk_forward(df, spec, folds=4)
+    assert wf["folds"] == 4
+    assert 0 <= wf["positive_folds"] <= 4
+    v = strategy_lab.validate(df, spec)
+    assert {"holdout", "walk_forward", "validated"} <= set(v)
+    assert isinstance(v["validated"], bool)
 
 
 # ── Integrity / brief / MCP ─────────────────────────────────────────────────

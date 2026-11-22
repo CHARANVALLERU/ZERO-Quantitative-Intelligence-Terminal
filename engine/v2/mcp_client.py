@@ -54,6 +54,35 @@ class MCPError(RuntimeError):
     """Raised for transport, protocol or server-reported failures."""
 
 
+def _timeout_value(default: float) -> float:
+    """Allow a slower first run (``npx`` may install the package) without
+    changing code: ``ZERO_MCP_TIMEOUT`` in seconds, clamped to 5-300."""
+    raw = os.getenv("ZERO_MCP_TIMEOUT", "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return min(300.0, max(5.0, value))
+
+
+def _validate_spec(command: str, args: List[str]) -> None:
+    """Reject launch specs that cannot be passed safely to a child process.
+
+    The registry is a local file, but it is the one place where a string
+    becomes an executable, so shell metacharacters and line breaks are refused
+    rather than interpreted.
+    """
+    if not isinstance(command, str) or not command.strip():
+        raise MCPError("server command is empty")
+    if any(ch in command for ch in '&|<>^%"\'`\n\r'):
+        raise MCPError(f"server command contains unsafe characters: {command!r}")
+    for arg in args:
+        if not isinstance(arg, str) or "\n" in arg or "\r" in arg:
+            raise MCPError(f"server argument is not a single string: {arg!r}")
+
+
 def load_registry() -> Dict[str, Any]:
     try:
         with open(REGISTRY_PATH, "r", encoding="utf-8") as fh:
@@ -77,6 +106,27 @@ def save_registry(registry: Dict[str, Any]) -> bool:
         return False
 
 
+def node_runtime() -> Any:
+    """Resolve the Node runtime used to launch MCP servers.
+
+    ``ZERO_NODE`` (a node executable) or ``ZERO_NODE_DIR`` (a directory that
+    holds node/node.exe, npm and npx) takes precedence over PATH. That lets a
+    side-by-side Node, installed without administrator rights, satisfy a
+    server's ``engines`` range without replacing the machine-wide install.
+
+    Returns ``(node_path, override_directory_or_None)``.
+    """
+    explicit = os.getenv("ZERO_NODE", "").strip()
+    if explicit and os.path.isfile(explicit):
+        return explicit, os.path.dirname(explicit)
+    directory = os.getenv("ZERO_NODE_DIR", "").strip()
+    if directory:
+        exe = os.path.join(directory, "node.exe" if os.name == "nt" else "node")
+        if os.path.isfile(exe):
+            return exe, directory
+    return shutil.which("node"), None
+
+
 class MCPClient:
     """One stdio MCP server connection."""
 
@@ -86,6 +136,14 @@ class MCPClient:
         self.command = command
         self.args = list(args or [])
         self.env = {**os.environ, **(env or {})}
+        _, node_dir = node_runtime()
+        if node_dir:
+            # A server's own bin shims resolve `node` from PATH (not execPath),
+            # so an explicit runtime has to lead PATH as well.
+            current = next((v for k, v in self.env.items() if k.upper() == "PATH"), "")
+            for key in [k for k in self.env if k.upper() == "PATH"]:
+                self.env.pop(key, None)
+            self.env["PATH"] = node_dir + os.pathsep + current
         self.cwd = cwd
         self.timeout = timeout
         self._proc: Optional[subprocess.Popen] = None
@@ -133,10 +191,14 @@ class MCPClient:
         exe = shutil.which(self.command) or self.command
         if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
             stem = os.path.splitext(os.path.basename(exe))[0]
+            node, node_dir = node_runtime()
+            if node_dir:
+                local_shim = os.path.join(node_dir, f"{stem}.cmd")
+                if os.path.isfile(local_shim):
+                    exe = local_shim
             npm_cli = os.path.join(
                 os.path.dirname(exe), "node_modules", "npm", "bin", f"{stem}-cli.js"
             )
-            node = shutil.which("node")
             if node and os.path.isfile(npm_cli):
                 return [node, npm_cli, *self.args]
             quoted = subprocess.list2cmdline([exe, *self.args])
@@ -274,12 +336,14 @@ def client_for(server_id: str, timeout: float = DEFAULT_TIMEOUT) -> MCPClient:
     command = cfg.get("command")
     if not command:
         raise MCPError(f"server {server_id!r} has no command")
+    args = list(cfg.get("args") or [])
+    _validate_spec(command, args)
     return MCPClient(
         command=command,
-        args=cfg.get("args") or [],
+        args=args,
         env=cfg.get("env") or {},
         cwd=cfg.get("cwd") or None,
-        timeout=timeout,
+        timeout=_timeout_value(timeout),
     )
 
 

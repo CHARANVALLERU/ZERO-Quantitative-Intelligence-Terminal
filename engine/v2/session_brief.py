@@ -61,7 +61,7 @@ def build() -> Dict[str, Any]:
     registry = strategy_lab.load_registry()
     strategies = registry.get("strategies") or []
     passed = [s for s in strategies if s.get("status") == "PASSED"]
-    improved = [s for s in strategies if s.get("improved_from")]
+    validated = [s for s in strategies if s.get("validated")]
     top = registry.get("top") or []
 
     audit: Dict[str, Any] = {}
@@ -87,7 +87,7 @@ def build() -> Dict[str, Any]:
         "strategies_created": registry.get("total", len(strategies)),
         "strategies_passed": registry.get("passed", len(passed)),
         "strategies_failed": registry.get("failed", len(strategies) - len(passed)),
-        "improved": registry.get("improved", len(improved)),
+        "validated": registry.get("validated", len(validated)),
         "top": [
             {
                 "name": s.get("name"),
@@ -119,7 +119,7 @@ def summary_line(brief: Optional[Dict[str, Any]] = None) -> str:
     ) or "none yet"
     return (
         f"{b['strategies_created']} strategies · {b['strategies_passed']} passed · "
-        f"{b.get('improved', 0)} improved · top: {top_txt}"
+        f"{b.get('validated', 0)} validated · top: {top_txt}"
     )
 
 

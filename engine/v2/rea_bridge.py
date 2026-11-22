@@ -35,7 +35,6 @@ from engine.v2 import mcp_client
 
 SCHEMA_VERSION = "2.0"
 CACHE_PATH = os.path.join("db", "v2", "rea_tools.json")
-DEFAULT_REA_PATH = r"D:\D all\charan\personal\REA"
 
 # Capability buckets the engine cares about, mapped to keywords found in tool
 # names/descriptions. Ordered by preference inside each bucket.
@@ -70,19 +69,28 @@ def _write_json(path: str, payload: Any) -> bool:
 
 
 def rea_path() -> Optional[str]:
-    """Locate the local REA checkout, if one exists."""
+    """Locate the local REA checkout, if the operator configured one.
+
+    The path is deliberately not hard-coded: it is machine-specific and would
+    be wrong (or leak a personal path) on any other machine. Set it in ``.env``
+    as ``ZERO_REA_PATH``. The bridge itself runs through npx and does not need
+    a checkout.
+    """
     env = os.getenv("ZERO_REA_PATH", "").strip()
-    for candidate in (env, DEFAULT_REA_PATH):
-        if candidate and os.path.isdir(candidate):
-            return candidate
+    if env and os.path.isdir(env):
+        return env
     return None
 
 
 def environment() -> Dict[str, Any]:
     """Report what is needed and what is present. No process is started."""
     path = rea_path()
-    node = shutil.which("node")
+    node, node_dir = mcp_client.node_runtime()
     npx = shutil.which("npx")
+    if node_dir:
+        local_npx = os.path.join(node_dir, "npx.cmd" if os.name == "nt" else "npx")
+        if os.path.isfile(local_npx):
+            npx = local_npx
     version = None
     pkg = os.path.join(path, "package.json") if path else ""
     if pkg and os.path.isfile(pkg):
@@ -93,6 +101,7 @@ def environment() -> Dict[str, Any]:
         "rea_path": path,
         "package_version": version,
         "node": node,
+        "node_dir": node_dir,
         "npx": npx,
         "ready": bool(npx),
         "notes": [] if npx else [

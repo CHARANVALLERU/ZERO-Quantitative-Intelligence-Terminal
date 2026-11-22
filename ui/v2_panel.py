@@ -16,6 +16,7 @@ network) is unavailable.
 from __future__ import annotations
 
 import datetime as _dt
+import html as _html
 import json
 import os
 from typing import Any, Dict, List, Optional
@@ -69,9 +70,11 @@ def _kv(value: Any, fmt: str = "{:,.2f}") -> str:
 def _status_chip(label: str, ok: bool, detail: str = "") -> str:
     colour = _P["neon"] if ok else _P["crimson"]
     text = "OK" if ok else "ATTENTION"
+    # ``detail`` can carry text from a child process, so it is escaped before
+    # it enters the unsafe_allow_html block.
     return (
-        f"<span style='color:{colour};font-weight:700;'>{label} · {text}</span>"
-        f" <span style='color:{_P['mute']};'>{detail}</span>"
+        f"<span style='color:{colour};font-weight:700;'>{_html.escape(str(label))} · {text}</span>"
+        f" <span style='color:{_P['mute']};'>{_html.escape(str(detail))}</span>"
     )
 
 
@@ -144,7 +147,7 @@ def maybe_render_brief() -> None:
               <div style="color:#e8e8e8;font-size:0.86rem;margin-top:6px;">
                 {payload.get('strategies_created', 0)} strategies created ·
                 <span style="color:{_P['neon']};">{payload.get('strategies_passed', 0)} passed</span> ·
-                {payload.get('improved', 0)} improved ·
+                {payload.get('validated', 0)} validated ·
                 integrity {payload.get('health', {}).get('pct', '—')}%
               </div>
               <div style="margin-top:8px;">{top_html}</div>
@@ -355,7 +358,7 @@ def _render_strategy_lab() -> None:
 
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
-        improve = st.checkbox("Improve winners (OOS-validated)", value=True, key="v2_lab_improve")
+        refresh = st.checkbox("Refresh price cache", value=False, key="v2_lab_refresh")
     with c2:
         run = st.button("RUN STRATEGY LAB", key="v2_lab_run", width="stretch")
     with c3:
@@ -366,7 +369,7 @@ def _render_strategy_lab() -> None:
     if run:
         with st.spinner("Generating, backtesting and writing strategy documents…"):
             try:
-                result = strategy_lab.run_lab(improve_winners=improve)
+                result = strategy_lab.run_lab(refresh_data=refresh)
                 st.session_state["v2_lab_result"] = result
             except Exception as exc:
                 st.error(f"Strategy lab failed: {exc}")
@@ -376,7 +379,7 @@ def _render_strategy_lab() -> None:
     if result and result.get("created"):
         st.success(
             f"Run complete — {result['created']} strategies written, "
-            f"{result['passed']} passed, {result['improved']} improved."
+            f"{result['passed']} passed the gate, {result['validated']} validated."
         )
         if result.get("skipped"):
             with st.expander(f"SKIPPED ({len(result['skipped'])})"):
@@ -385,9 +388,9 @@ def _render_strategy_lab() -> None:
     if not registry.get("total"):
         _card(
             "STRATEGY LAB — NO STRATEGIES YET",
-            "Press <b>RUN STRATEGY LAB</b>. The engine will generate rule sets across "
-            "momentum, mean reversion, pullback, squeeze, absorption and sweep families, "
-            "backtest each on NIFTY and SENSEX with ATR stops and realistic costs, then write "
+            "Press <b>RUN STRATEGY LAB</b>. The engine tests the proven momentum edge through "
+            "breakout, major-breakout, pullback and trend families, long-only, with ATR stops, "
+            "a chandelier trail and realistic costs, then write "
             "<code>strategies/&lt;ID&gt;.md</code> and "
             "<code>strategies/_@&lt;ID&gt;_, mistakes and P&amp;L.md</code>.",
         )
@@ -396,7 +399,7 @@ def _render_strategy_lab() -> None:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("CREATED", registry.get("total", 0))
     m2.metric("PASSED", registry.get("passed", 0))
-    m3.metric("IMPROVED", registry.get("improved", 0))
+    m3.metric("VALIDATED", registry.get("validated", 0))
     m4.metric("UPDATED", str(registry.get("updated_at", "—"))[:10])
 
     st.markdown("<p class='label-grey'>TOP 3 (profit factor × sample weight)</p>", unsafe_allow_html=True)
@@ -418,7 +421,8 @@ def _render_strategy_lab() -> None:
         "PF": (s.get("metrics") or {}).get("profit_factor"),
         "RETURN %": (s.get("metrics") or {}).get("return_pct"),
         "TRADES": (s.get("metrics") or {}).get("trades"),
-        "IMPROVED FROM": s.get("improved_from") or "—",
+        "HOLDOUT PF": (s.get("holdout") or {}).get("profit_factor", "—"),
+        "VALIDATED": "yes" if s.get("validated") else "no",
     } for s in registry.get("strategies", [])]
     st.dataframe(pd.DataFrame(all_rows), width="stretch", hide_index=True)
 
@@ -480,9 +484,11 @@ def _render_mcp() -> None:
     state = status.get("state")
     c1, c2 = st.columns([2, 3])
     with c1:
-        if st.button("DISCOVER REA TOOLS", key="v2_rea_probe", width="stretch"):
+        # The result must not reuse the button's own key: Streamlit forbids
+        # writing to a widget key after the widget is instantiated.
+        if st.button("DISCOVER REA TOOLS", key="v2_rea_probe_btn", width="stretch"):
             with st.spinner("Starting REA over MCP and listing tools…"):
-                st.session_state["v2_rea_probe"] = rea_bridge.probe_rea()
+                st.session_state["v2_rea_probe_result"] = rea_bridge.probe_rea()
             st.rerun()
     with c2:
         st.caption(
@@ -495,10 +501,10 @@ def _render_mcp() -> None:
         "MCP RESEARCH BRIDGE",
         _status_chip("REA", state == "CONNECTED", f"{status.get('tool_count', 0)} tools cached")
         + f"<br/>Registry: <code>config/mcp_servers.json</code> · transport: stdio JSON-RPC 2.0"
-        + (f"<br/><span style='color:{_P['mute']};'>{status.get('error')}</span>"
+        + (f"<br/><span style='color:{_P['mute']};'>{_html.escape(str(status.get('error')))}</span>"
            if status.get("error") else "")
         + "".join(
-            f"<br/><code style='color:{_P['mute']};font-size:0.72rem;'>{line}</code>"
+            f"<br/><code style='color:{_P['mute']};font-size:0.72rem;'>{_html.escape(str(line))}</code>"
             for line in (status.get("stderr_tail") or [])[-3:]
         ),
         accent=colour,

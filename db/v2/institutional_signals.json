@@ -1,0 +1,84 @@
+{
+  "schema": "2.0",
+  "updated_at": "2026-11-21T00:00:00",
+  "asof": "2026-11-20",
+  "score_scale": "Each event carries score in [-1, 1]: +1 strongly bullish flow/filing, -1 strongly bearish. The aggregator averages events per symbol and renormalises weights over whatever coverage exists.",
+  "market_flow": {
+    "fii_net_equity_usd_bn_week_to_2026_11_13": 3.0,
+    "dii_net_equity_usd_bn_week_to_2026_11_13": -2.0,
+    "fii_net_equity_usd_bn_november_to_date": 10.0,
+    "promoter_net_open_market_inr_cr_30d_to_2026_11_19": -252,
+    "source": "Goldman Sachs India strategy note (via Financial Express, 17 Nov 2026); CNBC TV18 FII flows, 18 Nov 2026; SEBI filings via DocStoX, 19 Nov 2026",
+    "note": "Market-wide context only. The per-symbol sections below are what the aggregator scores."
+  },
+  "institutional_flow": {
+    "HDFCBANK": [
+      {
+        "score": 0.75,
+        "asof": "2026-11-18",
+        "source": "CNBC TV18, 18 Nov 2026 (Goldman Sachs data): FII holding in HDFC Bank up 17% this month, 3.73 crore shares",
+        "note": "Largest FII holding change among the top-10 Indian names this month."
+      }
+    ],
+    "ICICIBANK": [
+      {
+        "score": 0.68,
+        "asof": "2026-11-18",
+        "source": "CNBC TV18, 18 Nov 2026 (Goldman Sachs data): FII holding in ICICI Bank up 15% this month, 4.79 crore shares",
+        "note": "Largest FII holding by value; still being added to."
+      }
+    ],
+    "RELIANCE": [
+      {
+        "score": 0.75,
+        "asof": "2026-11-18",
+        "source": "CNBC TV18, 18 Nov 2026 (Goldman Sachs data): FII holding in Reliance Industries up 17% this month, 2.63 crore shares",
+        "note": "Consistent with FII buying of large caps during the November inflow."
+      }
+    ],
+    "AXISBANK": [
+      {
+        "score": 0.55,
+        "asof": "2026-11-18",
+        "source": "CNBC TV18, 18 Nov 2026 (Goldman Sachs data): FII holding in Axis Bank up 12% this month, 1.57 crore shares",
+        "note": "Fifth-largest FII holding by value."
+      }
+    ],
+    "BAJFINANCE": [
+      {
+        "score": 0.78,
+        "asof": "2026-11-18",
+        "source": "CNBC TV18, 18 Nov 2026 (Goldman Sachs data): FII holding in Bajaj Finance up 18% this month, 1.18 crore shares",
+        "note": "Largest percentage FII increase among the top-10 holdings."
+      }
+    ],
+    "ITC": [
+      {
+        "score": 0.4,
+        "asof": "2026-11-18",
+        "source": "CNBC TV18, 18 Nov 2026 (Goldman Sachs data): FII holding in ITC up 9% this month, 1.09 crore shares",
+        "note": "Weakest of the top-10 FII increases; ITC also dragged Nifty earnings in Q2FY27."
+      }
+    ],
+    "V2RETAIL": [
+      {
+        "score": 0.1,
+        "asof": "2026-11-20",
+        "source": "NSE bulk/block deals, 20 Nov 2026 (Strota, ChartMine, EdgeTest): QE Securities LLP and HRTI Pvt Ltd crossed on both sides; net disclosed inflow about Rs 5.1 Cr",
+        "note": "Same-day prop/HFT churn in a small cap, not a directional institution. Net 30-day bulk flow is about -Rs 195 Cr, so the score is only mildly positive."
+      }
+    ]
+  },
+  "insider_filing": {
+    "BAJFINANCE": [
+      {
+        "score": 1.0,
+        "asof": "2026-11-19",
+        "source": "SEBI insider/promoter disclosures, 30 days to 19 Nov 2026 (DocStoX): promoters bought Rs 400 Cr net, 2 buyers and 0 sellers",
+        "note": "Largest net promoter purchase in the tracked window."
+      }
+    ]
+  },
+  "corporate_release": {},
+  "govt_release": {}
+}

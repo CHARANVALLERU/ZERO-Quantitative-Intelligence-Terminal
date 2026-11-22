@@ -2,26 +2,39 @@
 ZERO Engine v2.0 — Strategy Lab
 ===============================
 
-Turns everything the engine has studied (macro regime, unified view, market
-structure) into **named, documented, backtested strategies** that a human can
-read, audit and reuse.
+Turns market history into **named, documented, backtested strategies** that a
+human can read, audit and reuse.
 
-Contract:
+What changed in the 2.1 rework (and why)
+----------------------------------------
+The first lab shipped six pattern families and 43 presets. A measured audit of
+those presets showed the patterns had no edge on daily index bars: profit
+factors clustered at 0.5-1.1, and **every** short-side preset lost money
+(short PF 0.2-0.6 across the board) because these indices drift upward. The
+only mechanism with a repeatable, out-of-sample edge was **time-series
+momentum**: buying a new N-day high while price is above a rising regime mean,
+with a wide ATR stop and a trailing exit that keeps the right tail.
 
-* Every strategy gets an alphanumeric id: ``Z2-<FAMILY>-<HASH4>``.
-* Every strategy is written to ``strategies/<ID>.md`` in plain language —
-  entry, exit, stop, sizing, and *why* the edge should exist.
-* Every strategy gets ``strategies/_@<ID>, mistakes and P&L.md`` with the
-  realised P&L, the trade ledger summary and the specific mistakes measured
-  from that run — not generic advice.
-* Passing strategies are re-optimised on a train window and re-validated on an
-  untouched out-of-sample window. An improvement is only accepted if OOS
-  profit factor does not degrade.
+So the lab now trades one proven mechanism through four genuinely different
+horizons/filters, long-only by default, and it reports validation instead of
+searching 40 parameter mutations until something passes:
+
+* ``BREAKOUT`` — swing breakout (15-30 day high) in a rising regime.
+* ``MAJOR``    — position breakout (40-55 day high), fewer, larger trades.
+* ``PULLBACK`` — breakout that is *not extended* from the short mean, i.e. the
+  first thrust out of a pullback rather than a chased move.
+* ``TREND``    — regime cross with a hold-until-regime-loss exit.
+
+Contract (unchanged):
+
+* Every strategy gets an alphanumeric id: ``Z2-<FAMILY>-<INDEX2><HASH4>``.
+* Every strategy is written to ``strategies/<ID>.md`` in plain language.
+* ``strategies/_@<ID>, mistakes and P&L.md`` carries the run's measured
+  mistakes and the worst/best trades.
 * ``strategies/index.json`` is the registry the UI and the daily brief read.
-
-Risk posture is deliberately conservative: long-only (cash when flat), every
-trade carries an ATR stop, size is derived from a fixed fraction of capital at
-risk, and round-trip costs are charged on every trade.
+* The gate is untouched: >=20 trades, profit factor >=1.15, drawdown <=12%,
+  and positive net P&L. Validation (holdout + fold consistency) is reported
+  *in addition* to the gate, never instead of it.
 """
 
 from __future__ import annotations
@@ -32,32 +45,78 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 STRATEGY_DIR = "strategies"
 REGISTRY_PATH = os.path.join(STRATEGY_DIR, "index.json")
+CACHE_DIR = os.path.join("db", "v2", "cache")
 
 DEFAULT_CAPITAL = 1_000_000.0
 DEFAULT_RISK_PCT = 0.75          # % of capital risked per trade
-DEFAULT_COST_BPS = 12.0          # round-trip brokerage + STT + slippage proxy
+DEFAULT_COST_BPS = 12.0          # per leg: brokerage + STT + slippage proxy
 MIN_TRADES_TO_PASS = 20
 MIN_PROFIT_FACTOR = 1.15
 MAX_DRAWDOWN_PCT = 12.0
-MIN_OOS_PROFIT_FACTOR = 1.00
+HOLDOUT_FRACTION = 0.30
+MIN_HOLDOUT_TRADES = 5
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Data
+#  Data (cached, with provenance)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _frame(index_key: str, period: str = "3y"):
-    """Load daily OHLCV for a config index key. Returns None on failure."""
+def _cache_paths(index_key: str) -> Tuple[str, str]:
+    stem = os.path.join(CACHE_DIR, f"{index_key.upper()}")
+    return stem + ".pkl", stem + ".json"
+
+
+def _read_cache(index_key: str):
+    """Return cached OHLCV when it is younger than a day, else None."""
+    import pandas as pd
+
+    pkl, meta = _cache_paths(index_key)
+    try:
+        if os.path.getmtime(pkl) > _dt.datetime.now().timestamp() - 86_400:
+            df = pd.read_pickle(pkl)
+            if df is not None and len(df) > 200:
+                return df
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _write_cache(index_key: str, df) -> None:
+    pkl, meta = _cache_paths(index_key)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        df.to_pickle(pkl)
+        with open(meta, "w", encoding="utf-8") as fh:
+            json.dump({
+                "index": index_key,
+                "source": "yfinance:get_historical_data(10y)",
+                "rows": int(len(df)),
+                "first": str(df.index[0])[:10],
+                "last": str(df.index[-1])[:10],
+                "fetched_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            }, fh, indent=2)
+    except Exception:
+        pass
+
+
+def _frame(index_key: str, period: str = "10y", refresh: bool = False):
+    """Load daily OHLCV for an index key. Cached for a day; None on failure."""
+    if not refresh:
+        cached = _read_cache(index_key)
+        if cached is not None:
+            return cached
     try:
         from data.historical import get_historical_data
         from engine.v2.aggregator import _flatten_ohlcv
-        raw = get_historical_data(index_key, period=period)
-        return _flatten_ohlcv(raw)
+        df = _flatten_ohlcv(get_historical_data(index_key, period=period))
+        if df is not None and len(df):
+            _write_cache(index_key, df)
+        return df
     except Exception:
         return None
 
@@ -73,21 +132,23 @@ def _atr_series(df, period: int = 14):
 #  Strategy specification
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dataclass
 DEFAULT_PARAMS: Dict[str, Any] = {
     "regime": 200,          # structural mean used as the trade permission gate
-    "confirm": 0.60,        # close must finish in the trade's third of the bar
-    "exit_regime": 1,       # flatten when price closes back through the regime mean
-    "trail_atr": 2.0,       # trail 2 x ATR after +1.5R
-    "breakeven_r": 1.0,     # move the stop to entry at +1R
-    "direction_mode": "long_short",  # trade the regime, both ways
+    "slope_len": 20,        # the mean must actually be rising, not merely flat
+    "confirm": 0.55,        # close must finish in the trade's half of the bar
+    "exit_regime": 1,       # flatten when price closes back through the mean
+    "trail_atr": 6.0,       # chandelier trail: the mechanism that keeps the tail
+    "stop_atr": 2.0,        # initial ATR stop distance
+    "time_stop": 400,       # effectively a safety valve, not a strategy exit
+    "direction_mode": "long",  # shorts measured negative; opt in only deliberately
 }
 
 
+@dataclass
 class StrategySpec:
     """A fully described, reproducible rule set."""
 
-    family: str                     # MOM, REV, PULL, SQZ, ABS, SWEEP
+    family: str                     # BREAKOUT, MAJOR, PULLBACK, TREND
     index_key: str                  # NIFTY | BANKNIFTY | SENSEX
     params: Dict[str, float] = field(default_factory=dict)
     name: str = ""
@@ -96,14 +157,10 @@ class StrategySpec:
     exit_text: str = ""
     risk_text: str = ""
     source_study: str = ""
-    improved_from: str = ""
 
     def __post_init__(self) -> None:
-        # Structural guard shared by every spec. Without it a family is just a
-        # pattern matcher that buys into bear phases and chop. These defaults
-        # are part of the strategy's identity, so they are folded in before the
-        # name hash is computed — two specs with different guards get different
-        # ids.
+        # Structural guard shared by every spec. Folded in before the name hash
+        # so two specs with different guards get different ids.
         for key, value in DEFAULT_PARAMS.items():
             self.params.setdefault(key, value)
         if not self.name:
@@ -122,165 +179,116 @@ def make_name(family: str, index_key: str, params: Dict[str, float]) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Signal families
+#  Signals
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _signals(df, spec: StrategySpec):
-    """Build long/short entry and exit masks. All decisions use closed bars.
+def _signals(df, spec: StrategySpec) -> Dict[str, Any]:
+    """Entry/exit masks. Every decision uses closed bars only.
 
-    Three structural filters sit in front of every family:
-
-    1. **Regime gate** — longs only above a rising ``regime``-day mean, shorts
-       only below a falling one. This is what stops a long-only family from
-       buying into a bear phase; it is the difference between a pattern and a
-       trade.
-    2. **Confirmation close** — the signal bar must finish in the trade's own
-       third of its range (top for longs, bottom for shorts), so a wick is not
-       mistaken for acceptance.
-    3. **Volatility ceiling** — optional ``atr_pct_max`` refuses chaotic bars
-       where stop distance is meaningless.
-
-    Returns ``{"long_entry", "short_entry", "long_exit", "short_exit"}``.
+    The regime gate is the single most important filter: longs need price above
+    a mean that has risen over ``slope_len`` bars, shorts need the mirror. A
+    flat or falling mean is not a trend, and every measured attempt to trade
+    against it lost money.
     """
-    import pandas as pd  # noqa: F401
+    import pandas as pd
 
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
-    vol = df["Volume"].astype(float) if "Volume" in df.columns else None
     atr = _atr_series(df)
     p = spec.params
-    n = int(p.get("lookback", 20))
     false = pd.Series(False, index=df.index)
+
+    regime_len = int(p.get("regime", 0) or 0)
+    regime_sma = close.rolling(regime_len).mean() if regime_len > 1 else false.astype(float)
+    slope_len = int(p.get("slope_len", 20) or 20)
+    slope = regime_sma.diff(slope_len) if regime_len > 1 else false.astype(float)
+    up_regime = (close > regime_sma) & (slope > 0) if regime_len > 1 else pd.Series(True, index=df.index)
+    down_regime = (close < regime_sma) & (slope < 0) if regime_len > 1 else up_regime.copy()
+
+    bar_range = (high - low).replace(0, float("nan"))
+    close_pos = (close - low) / bar_range
+    confirm = float(p.get("confirm", 0.0) or 0.0)
+    confirm_long = close_pos >= confirm if confirm > 0 else pd.Series(True, index=df.index)
+    confirm_short = (1.0 - close_pos) >= confirm if confirm > 0 else confirm_long.copy()
 
     long_entry = false.copy()
     short_entry = false.copy()
     long_exit = false.copy()
     short_exit = false.copy()
 
-    # ── Structural regime ──────────────────────────────────────────────────
-    regime_len = int(p.get("regime", 0) or 0)
-    if regime_len > 1:
-        regime_sma = close.rolling(regime_len).mean()
-        regime_slope = regime_sma.diff()
-        up_regime = (close > regime_sma) & (regime_slope >= 0)
-        down_regime = (close < regime_sma) & (regime_slope <= 0)
-        lost_regime_long = close < regime_sma
-        lost_regime_short = close > regime_sma
-    else:
-        regime_sma = false.astype(float)
-        up_regime = pd.Series(True, index=df.index)
-        down_regime = up_regime.copy()
-        lost_regime_long = false.copy()
-        lost_regime_short = false.copy()
+    if spec.family in ("BREAKOUT", "MAJOR"):
+        lookback = int(p.get("lookback", 20))
+        prior_high = high.rolling(lookback).max().shift(1)
+        prior_low = low.rolling(lookback).min().shift(1)
+        long_entry = close > prior_high
+        short_entry = close < prior_low
 
-    allow_short = str(p.get("direction_mode", "long")) == "long_short"
+    elif spec.family == "PULLBACK":
+        lookback = int(p.get("lookback", 10))
+        fast = close.rolling(int(p.get("fast", 20))).mean()
+        prior_high = high.rolling(lookback).max().shift(1)
+        # A breakout is only a *pullback* trade while price is still near the
+        # short mean; once it is extended the same entry is chasing.
+        long_entry = (close > prior_high) & (close <= fast * (1 + float(p.get("ext", 0.02))))
 
-    # ── Confirmation close ─────────────────────────────────────────────────
-    bar_range = (high - low).replace(0, float("nan"))
-    close_pos = (close - low) / bar_range
-    confirm = float(p.get("confirm", 0.0) or 0.0)
-    if confirm > 0:
-        confirm_long = close_pos >= confirm
-        confirm_short = (1.0 - close_pos) >= confirm
-    else:
-        confirm_long = pd.Series(True, index=df.index)
-        confirm_short = confirm_long.copy()
+    elif spec.family == "TREND":
+        long_entry = (close > regime_sma) & (close.shift(1) <= regime_sma.shift(1))
+        short_entry = (close < regime_sma) & (close.shift(1) >= regime_sma.shift(1))
+        long_exit = close < regime_sma
+        short_exit = close > regime_sma
 
-    # ── Volatility ceiling ─────────────────────────────────────────────────
-    atr_cap = float(p.get("atr_pct_max", 0.0) or 0.0)
-    if atr_cap > 0:
-        vol_ok = ((atr / close.replace(0, float("nan"))) <= atr_cap).fillna(False)
-    else:
-        vol_ok = pd.Series(True, index=df.index)
+    long_entry = long_entry & up_regime & confirm_long
+    short_entry = short_entry & down_regime & confirm_short
 
-    if spec.family == "MOM":            # Donchian breakout, both directions
-        upper = high.rolling(n).max().shift(1)
-        lower = low.rolling(n).min().shift(1)
-        sma = close.rolling(int(p.get("trend", 100))).mean()
-        long_entry = (close > upper) & (close > sma) & up_regime
-        short_entry = (close < lower) & (close < sma) & down_regime
-        long_exit = close < low.rolling(int(p.get("exit_lookback", 10))).min().shift(1)
-        short_exit = close > high.rolling(int(p.get("exit_lookback", 10))).max().shift(1)
-
-    elif spec.family == "REV":          # Panic inside an uptrend; squeeze in a downtrend
-        sma = close.rolling(int(p.get("trend", 100))).mean()
-        rsi = _rsi(close, int(p.get("rsi_len", 3)))
-        rsi_buy = float(p.get("rsi_buy", 15))
-        rsi_sell = float(p.get("rsi_sell", 65))
-        long_entry = (close > sma) & (rsi < rsi_buy) & up_regime
-        short_entry = (close < sma) & (rsi > (100.0 - rsi_buy)) & down_regime
-        long_exit = (rsi > rsi_sell) | (close < sma * 0.97)
-        short_exit = (rsi < (100.0 - rsi_sell)) | (close > sma * 1.03)
-
-    elif spec.family == "PULL":         # Buy the dip with the trend; sell the rally in a downtrend
-        sma_fast = close.rolling(int(p.get("fast", 20))).mean()
-        sma_slow = close.rolling(int(p.get("slow", 100))).mean()
-        dip = float(p.get("dip", 0.01))
-        target = float(p.get("target", 0.02))
-        long_entry = (sma_fast > sma_slow) & (close <= sma_fast * (1 - dip)) & up_regime
-        short_entry = (sma_fast < sma_slow) & (close >= sma_fast * (1 + dip)) & down_regime
-        long_exit = close > sma_fast * (1 + target)
-        short_exit = close < sma_fast * (1 - target)
-
-    elif spec.family == "SQZ":          # Contraction, then expansion either way
-        rng = (high - low) / close
-        compression = rng.rolling(int(p.get("squeeze", 10))).mean() < (
-            rng.rolling(int(p.get("base", 60))).mean() * float(p.get("ratio", 0.7))
-        )
-        long_entry = compression.shift(1) & (close > high.shift(1)) & up_regime
-        short_entry = compression.shift(1) & (close < low.shift(1)) & down_regime
-        long_exit = close < low.rolling(int(p.get("exit_lookback", 7))).min().shift(1)
-        short_exit = close > high.rolling(int(p.get("exit_lookback", 7))).max().shift(1)
-
-    elif spec.family == "ABS":          # Absorption bar, direction must agree with close
-        if vol is not None:
-            vz = (vol - vol.rolling(20).mean()) / vol.rolling(20).std(ddof=0).replace(0, float("nan"))
-            tight = (high - low) < atr * float(p.get("compress", 0.6))
-            strong = vz > float(p.get("vol_z", 2.0))
-            up_close = close > close.shift(1)
-            down_close = close < close.shift(1)
-            long_entry = strong & tight & up_close & up_regime
-            short_entry = strong & tight & down_close & down_regime
-        long_exit = close < low.rolling(int(p.get("exit_lookback", 7))).min().shift(1)
-        short_exit = close > high.rolling(int(p.get("exit_lookback", 7))).max().shift(1)
-
-    elif spec.family == "SWEEP":        # Failed break, reclaimed level, regime agrees
-        prior_low = low.rolling(int(p.get("lookback", 10))).min().shift(1)
-        prior_high = high.rolling(int(p.get("lookback", 10))).max().shift(1)
-        long_entry = (low < prior_low) & (close > prior_low) & up_regime
-        short_entry = (high > prior_high) & (close < prior_high) & down_regime
-        long_exit = close > high.rolling(int(p.get("target_lookback", 10))).max().shift(1)
-        short_exit = close < low.rolling(int(p.get("target_lookback", 10))).min().shift(1)
-
-    # ── Apply the shared filters ───────────────────────────────────────────
-    long_entry = long_entry & confirm_long & vol_ok
-    short_entry = (short_entry & confirm_short & vol_ok) if allow_short else false.copy()
+    if str(p.get("direction_mode", "long")) != "long_short":
+        short_entry = false.copy()
 
     if regime_len > 1 and int(p.get("exit_regime", 1) or 0):
-        long_exit = long_exit | lost_regime_long
-        short_exit = short_exit | lost_regime_short
+        long_exit = long_exit | (close < regime_sma)
+        short_exit = short_exit | (close > regime_sma)
 
     return {
         "long_entry": long_entry.fillna(False),
         "short_entry": short_entry.fillna(False),
         "long_exit": long_exit.fillna(False),
         "short_exit": short_exit.fillna(False),
+        "atr": atr,
     }
-
-
-def _rsi(close, length: int = 3):
-    import pandas as pd
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(length).mean()
-    loss = (-delta.clip(upper=0)).rolling(length).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    return (100 - (100 / (1 + rs))).fillna(50)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Backtest
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _warmup(spec: StrategySpec) -> int:
+    return max(
+        int(spec.params.get("regime", 0) or 0),
+        int(spec.params.get("fast", 0) or 0),
+        int(spec.params.get("lookback", 0) or 0),
+    ) + 5
+
+
+def _trade_row(pos, side, exit_price, exit_date, reason, bars_held, net) -> Dict[str, Any]:
+    risk0 = float(pos["risk0"])
+    return {
+        "side": "LONG" if side > 0 else "SHORT",
+        "entry_date": pos["entry_date"],
+        "exit_date": exit_date,
+        "entry": round(pos["entry"], 2),
+        "exit": round(exit_price, 2),
+        "qty": round(pos["qty"], 3),
+        "stop": round(pos["initial_stop"], 2),
+        "pnl": round(net, 2),
+        "r_multiple": round(((exit_price - pos["entry"]) * side) / max(1e-9, risk0), 2),
+        "reason": reason,
+        "bars_held": bars_held,
+        "mae_pts": round(pos["mae"], 1),
+        "mfe_pts": round(pos["mfe"], 1),
+        "stop_atr": round(risk0, 1),
+        "entry_atr": round(pos["entry_atr"], 1),
+    }
+
 
 def backtest(
     df,
@@ -288,156 +296,136 @@ def backtest(
     capital: float = DEFAULT_CAPITAL,
     risk_pct: float = DEFAULT_RISK_PCT,
     cost_bps: float = DEFAULT_COST_BPS,
-    start: int = 120,
+    start: Optional[int] = None,
     end: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Long-only, ATR-stopped, cost-charged backtest.
+    """Regime-gated, ATR-stopped, trailing, cost-charged backtest.
 
-    Entry is taken at the **next bar's open** after a signal on the close, so
-    there is no look-ahead. If both the stop and the target are inside the same
-    bar, the stop is assumed to fill first (conservative).
+    Entry fills at the **next bar's open** after a signal on the close, so there
+    is no look-ahead. The stop is checked before the target, and the watcher
+    stop only ratchets from bar to bar (never from the same bar's high), so a
+    single bar cannot both raise the stop and trigger it.
     """
+    warmup = _warmup(spec)
+    start = max(int(start if start is not None else warmup), warmup)
     if df is None or len(df) < start + 20:
         return {"status": "NO_DATA", "trades": [], "metrics": {}}
 
-    df = df.reset_index(drop=False)
-    # The index name varies by provider (index / Date / Datetime). Normalize it.
-    if "date" not in df.columns:
-        first = df.columns[0]
-        df = df.rename(columns={first: "date"})
-    atr = _atr_series(df.set_index("date"))
-    entry_sig, exit_sig = _signals(df.set_index("date"), spec)
-    entry_sig = entry_sig.reset_index(drop=True)
-    exit_sig = exit_sig.reset_index(drop=True)
-    atr = atr.reset_index(drop=True)
+    d = df.reset_index(drop=False)
+    if "date" not in d.columns:
+        d = d.rename(columns={d.columns[0]: "date"})
 
-    open_ = df["Open"].astype(float).reset_index(drop=True)
-    high = df["High"].astype(float).reset_index(drop=True)
-    low = df["Low"].astype(float).reset_index(drop=True)
-    close = df["Close"].astype(float).reset_index(drop=True)
-    dates = [str(d)[:10] for d in df["date"]] if "date" in df.columns else [str(i) for i in range(len(df))]
+    signals = _signals(d.set_index("date"), spec)
+    entry_long = signals["long_entry"].reset_index(drop=True)
+    entry_short = signals["short_entry"].reset_index(drop=True)
+    exit_long = signals["long_exit"].reset_index(drop=True)
+    exit_short = signals["short_exit"].reset_index(drop=True)
+    atr = signals["atr"].reset_index(drop=True)
 
-    end = end if end is not None else len(df)
-    stop_atr = float(spec.params.get("stop_atr", 1.5))
-    target_r = float(spec.params.get("target_r", 2.0))
-    time_stop = int(spec.params.get("time_stop", 20))
+    open_ = d["Open"].astype(float).reset_index(drop=True)
+    high = d["High"].astype(float).reset_index(drop=True)
+    low = d["Low"].astype(float).reset_index(drop=True)
+    close = d["Close"].astype(float).reset_index(drop=True)
+    dates = [str(x)[:10] for x in d["date"]]
+
+    end = len(d) if end is None else min(int(end), len(d))
+    stop_atr = float(spec.params.get("stop_atr", 2.0))
+    trail_atr = float(spec.params.get("trail_atr", 0.0) or 0.0)
+    time_stop = int(spec.params.get("time_stop", 400))
 
     trades: List[Dict[str, Any]] = []
     eq = capital
     peak = capital
     max_dd = 0.0
     curve: List[Tuple[str, float]] = [(dates[start], round(eq, 2))]
-
     pos: Optional[Dict[str, Any]] = None
-    for i in range(start, min(end, len(df) - 1)):
+
+    for i in range(start, end - 1):
         if pos is None:
-            if not bool(entry_sig.iloc[i]):
+            side = 1 if bool(entry_long.iloc[i]) else (-1 if bool(entry_short.iloc[i]) else 0)
+            if side == 0:
                 continue
             a = float(atr.iloc[i])
             if not math.isfinite(a) or a <= 0:
                 continue
             entry_price = float(open_.iloc[i + 1])
-            stop = entry_price - stop_atr * a
-            risk_per_unit = max(1e-9, entry_price - stop)
-            qty = (eq * risk_pct / 100.0) / risk_per_unit
-            cost = entry_price * qty * cost_bps / 10_000.0
+            risk = stop_atr * a
+            if risk <= 0:
+                continue
+            qty = (eq * risk_pct / 100.0) / risk
             pos = {
+                "side": side,
                 "entry_date": dates[i + 1],
                 "entry": entry_price,
-                "stop": stop,
-                "target": entry_price + target_r * risk_per_unit,
+                "stop": entry_price - side * risk,
+                "initial_stop": entry_price - side * risk,
                 "qty": qty,
                 "entry_i": i + 1,
-                "cost": cost,
+                "cost": entry_price * qty * cost_bps / 10_000.0,
                 "mae": 0.0,
                 "mfe": 0.0,
+                "best": entry_price,
                 "entry_atr": a,
-                "risk0": risk_per_unit,
+                "risk0": risk,
             }
             continue
 
-        # Manage the open position from the entry bar forward.
         j = i
         if j < pos["entry_i"]:
             continue
-        pos["mae"] = max(pos["mae"], pos["entry"] - float(low.iloc[j]))
-        pos["mfe"] = max(pos["mfe"], float(high.iloc[j]) - pos["entry"])
+        side = int(pos["side"])
+
+        if side > 0:
+            pos["best"] = max(pos["best"], float(high.iloc[j]))
+            pos["mfe"] = max(pos["mfe"], float(high.iloc[j]) - pos["entry"])
+            pos["mae"] = max(pos["mae"], pos["entry"] - float(low.iloc[j]))
+        else:
+            pos["best"] = min(pos["best"], float(low.iloc[j]))
+            pos["mfe"] = max(pos["mfe"], pos["entry"] - float(low.iloc[j]))
+            pos["mae"] = max(pos["mae"], float(high.iloc[j]) - pos["entry"])
 
         exit_price = None
         reason = ""
-        if float(low.iloc[j]) <= pos["stop"]:
-            exit_price, reason = pos["stop"], "STOP"
-        elif float(high.iloc[j]) >= pos["target"]:
-            exit_price, reason = pos["target"], "TARGET"
-        elif bool(exit_sig.iloc[j]):
-            exit_price, reason = float(close.iloc[j]), "SIGNAL_EXIT"
-        elif j - pos["entry_i"] >= time_stop:
+        if side > 0:
+            if float(low.iloc[j]) <= pos["stop"]:
+                exit_price, reason = pos["stop"], "STOP"
+            elif bool(exit_long.iloc[j]):
+                exit_price, reason = float(close.iloc[j]), "SIGNAL_EXIT"
+        else:
+            if float(high.iloc[j]) >= pos["stop"]:
+                exit_price, reason = pos["stop"], "STOP"
+            elif bool(exit_short.iloc[j]):
+                exit_price, reason = float(close.iloc[j]), "SIGNAL_EXIT"
+        if exit_price is None and j - pos["entry_i"] >= time_stop:
             exit_price, reason = float(close.iloc[j]), "TIME_STOP"
 
         if exit_price is None:
-            # Trade management for the *next* bar: move to breakeven at
-            # ``breakeven_r`` and trail by ``trail_atr`` once the trade has
-            # run 1.5R. This is the fix the mistakes reports prescribe, so it
-            # is part of the search space rather than an afterthought.
-            trail = float(spec.params.get("trail_atr", 0) or 0)
-            if trail > 0:
-                risk0 = float(pos.get("risk0") or (pos["entry"] - pos["stop"]))
-                be_r = float(spec.params.get("breakeven_r", 1.0) or 0)
-                if risk0 > 0 and pos["mfe"] >= be_r * risk0:
-                    pos["stop"] = max(pos["stop"], pos["entry"])
-                if risk0 > 0 and pos["mfe"] >= 1.5 * risk0:
-                    pos["stop"] = max(
-                        pos["stop"],
-                        float(high.iloc[j]) - trail * float(atr.iloc[j]),
-                    )
+            if trail_atr > 0 and math.isfinite(float(atr.iloc[j])):
+                trail = pos["best"] - side * trail_atr * float(atr.iloc[j])
+                pos["stop"] = max(pos["stop"], trail) if side > 0 else min(pos["stop"], trail)
             continue
 
-        gross = (exit_price - pos["entry"]) * pos["qty"]
+        gross = (exit_price - pos["entry"]) * pos["qty"] * side
         exit_cost = exit_price * pos["qty"] * cost_bps / 10_000.0
         net = gross - pos["cost"] - exit_cost
         eq += net
         peak = max(peak, eq)
-        dd = (peak - eq) / peak * 100.0 if peak else 0.0
-        max_dd = max(max_dd, dd)
+        max_dd = max(max_dd, (peak - eq) / peak * 100.0 if peak else 0.0)
 
-        r_multiple = (exit_price - pos["entry"]) / max(1e-9, pos["entry"] - pos["stop"])
-        trades.append({
-            "entry_date": pos["entry_date"],
-            "exit_date": dates[j],
-            "entry": round(pos["entry"], 2),
-            "exit": round(exit_price, 2),
-            "qty": round(pos["qty"], 3),
-            "stop": round(pos["stop"], 2),
-            "target": round(pos["target"], 2),
-            "pnl": round(net, 2),
-            "r_multiple": round(r_multiple, 2),
-            "reason": reason,
-            "bars_held": j - pos["entry_i"],
-            "mae_pts": round(pos["mae"], 1),
-            "mfe_pts": round(pos["mfe"], 1),
-            "stop_atr": round(pos["entry"] - pos["stop"], 1),
-            "entry_atr": round(pos["entry_atr"], 1),
-        })
+        trades.append(_trade_row(pos, side, exit_price, dates[j], reason, j - pos["entry_i"], net))
         curve.append((dates[j], round(eq, 2)))
         pos = None
 
-    # Close an open position at the last bar so P&L is complete.
     if pos is not None:
-        exit_price = float(close.iloc[-1])
-        net = (exit_price - pos["entry"]) * pos["qty"] - pos["cost"]
+        side = int(pos["side"])
+        exit_price = float(close.iloc[end - 1])
+        net = (exit_price - pos["entry"]) * pos["qty"] * side - pos["cost"]
         eq += net
-        trades.append({
-            "entry_date": pos["entry_date"], "exit_date": dates[-1],
-            "entry": round(pos["entry"], 2), "exit": round(exit_price, 2),
-            "qty": round(pos["qty"], 3), "stop": round(pos["stop"], 2),
-            "target": round(pos["target"], 2), "pnl": round(net, 2),
-            "r_multiple": round((exit_price - pos["entry"]) / max(1e-9, pos["entry"] - pos["stop"]), 2),
-            "reason": "MARK_TO_MARKET", "bars_held": len(df) - 1 - pos["entry_i"],
-            "mae_pts": round(pos["mae"], 1), "mfe_pts": round(pos["mfe"], 1),
-            "stop_atr": round(pos["entry"] - pos["stop"], 1),
-            "entry_atr": round(pos["entry_atr"], 1),
-        })
-        curve.append((dates[-1], round(eq, 2)))
+        trades.append(_trade_row(
+            pos, side, exit_price, dates[end - 1], "MARK_TO_MARKET",
+            end - 1 - pos["entry_i"], net,
+        ))
+        curve.append((dates[end - 1], round(eq, 2)))
 
     return {
         "status": "OK" if trades else "NO_TRADES",
@@ -473,7 +461,7 @@ def _metrics(
     mean_r = sum(returns) / n
     std_r = (sum((r - mean_r) ** 2 for r in returns) / max(1, n - 1)) ** 0.5
     sharpe = (mean_r / std_r * math.sqrt(max(1, n))) if std_r > 0 else 0.0
-    years = max(1e-9, (len(dates) - start) / 252.0)
+    years = max(1e-9, (end - start) / 252.0)
     cagr = ((equity / capital) ** (1 / years) - 1) * 100.0 if equity > 0 else -100.0
     passed = (
         n >= MIN_TRADES_TO_PASS
@@ -494,99 +482,130 @@ def _metrics(
         "cagr_pct": round(cagr, 2),
         "avg_bars_held": round(sum(t["bars_held"] for t in trades) / n, 1),
         "stop_rate_pct": round(sum(1 for t in trades if t["reason"] == "STOP") / n * 100.0, 1),
+        "long_trades": sum(1 for t in trades if t.get("side") == "LONG"),
+        "short_trades": sum(1 for t in trades if t.get("side") == "SHORT"),
         "passed": bool(passed),
     }
 
 
 def _oos_split(df) -> Tuple[int, int]:
     n = len(df)
-    return int(n * 0.70), n
+    return int(n * (1 - HOLDOUT_FRACTION)), n
+
+
+def walk_forward(df, spec: StrategySpec, folds: int = 5) -> Dict[str, Any]:
+    """Split the post-warmup history into contiguous folds. Rules are fixed, so
+    this measures *consistency through time*, not fitting: how many regimes the
+    edge survives, and the pooled profit factor across all folds."""
+    warmup = _warmup(spec)
+    span = len(df) - warmup
+    if span < folds * 60:
+        return {"folds": 0, "positive_folds": 0, "pooled_pf": 0.0, "trades": 0}
+    edges = [warmup + round(span * k / folds) for k in range(folds + 1)]
+    wins = losses = trades = positive = 0.0
+    for k in range(folds):
+        r = backtest(df, spec, start=edges[k], end=edges[k + 1])
+        pnls = [t["pnl"] for t in r.get("trades", [])]
+        if not pnls:
+            continue
+        w = sum(x for x in pnls if x > 0)
+        l = abs(sum(x for x in pnls if x <= 0))
+        wins += w
+        losses += l
+        trades += len(pnls)
+        positive += 1 if sum(pnls) > 0 else 0
+    pooled = wins / losses if losses else (99.0 if wins else 0.0)
+    return {
+        "folds": folds,
+        "positive_folds": int(positive),
+        "pooled_pf": round(pooled, 2),
+        "trades": int(trades),
+    }
+
+
+def validate(df, spec: StrategySpec) -> Dict[str, Any]:
+    """Holdout + fold consistency, reported independently of the gate."""
+    split, n = _oos_split(df)
+    hold = backtest(df, spec, start=split, end=n).get("metrics", {})
+    wf = walk_forward(df, spec)
+    validated = (
+        hold.get("trades", 0) >= MIN_HOLDOUT_TRADES
+        and hold.get("profit_factor", 0.0) >= 1.0
+        and hold.get("net_pnl", 0.0) > 0
+        and wf.get("positive_folds", 0) >= math.ceil(wf.get("folds", 5) * 0.6)
+    )
+    return {
+        "holdout": hold,
+        "walk_forward": wf,
+        "validated": bool(validated),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Families + parameter grids
+#  Families
 # ═══════════════════════════════════════════════════════════════════════════
 
 FAMILIES: Dict[str, Dict[str, Any]] = {
-    "MOM": {
+    "BREAKOUT": {
         "thesis": (
-            "Institutions cannot hide size. When price clears a 20-day high while "
-            "above the 100-day mean, the marginal seller is exhausted and the "
-            "remaining supply is above the market — continuation is the cheaper path."
+            "Time-series momentum: an index that prints a new 15-30 day high while above a "
+            "rising 200-day mean is being repriced, not exhausted. Trend persistence is one of "
+            "the most replicated effects in index data, and it survives costs because the "
+            "average winner is several times the ATR stop."
         ),
-        "entry": "Buy the next open after a close above the prior {lookback}-day high with close > {trend}-day mean.",
-        "exit": "Exit on a close below the prior {exit_lookback}-day low, the ATR stop, the {target_r}R target, or after {time_stop} bars.",
+        "entry": "Buy the next open when the close exceeds the prior {lookback}-day high.",
+        "exit": "Trail a {trail_atr}× ATR chandelier stop under the highest high since entry; "
+                "flatten on a close back below the regime mean or after {time_stop} bars.",
         "grid": [
-            {"lookback": 20, "trend": 100, "exit_lookback": 10, "stop_atr": 1.5, "target_r": 2.0, "time_stop": 20},
-            {"lookback": 55, "trend": 100, "exit_lookback": 20, "stop_atr": 2.0, "target_r": 2.5, "time_stop": 30},
-            {"lookback": 10, "trend": 50, "exit_lookback": 7, "stop_atr": 1.2, "target_r": 1.8, "time_stop": 12},
+            {"lookback": 15, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
+            {"lookback": 20, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
+            {"lookback": 30, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
         ],
     },
-    "REV": {
+    "MAJOR": {
         "thesis": (
-            "Short-term panic inside a long-term uptrend is liquidity demand, not "
-            "information. A 3-period RSI below 15 while above the 100-day mean is "
-            "a forced seller meeting a passive buyer."
+            "The same momentum effect on a position horizon. A 40-55 day high is rarer, so the "
+            "sample is smaller, but each signal marks a slower, better-established repricing "
+            "and the trailing exit can hold it for months."
         ),
-        "entry": "Buy the next open when RSI({rsi_len}) < {rsi_buy} and close > {trend}-day mean.",
-        "exit": "Exit when RSI({rsi_len}) > {rsi_sell}, or on the ATR stop / {target_r}R target / {time_stop}-bar time stop.",
+        "entry": "Buy the next open when the close exceeds the prior {lookback}-day high.",
+        "exit": "Trail a {trail_atr}× ATR chandelier stop; flatten on a close back below the "
+                "regime mean or after {time_stop} bars.",
         "grid": [
-            {"rsi_len": 3, "rsi_buy": 15, "rsi_sell": 65, "trend": 100, "stop_atr": 1.5, "target_r": 1.5, "time_stop": 10},
-            {"rsi_len": 2, "rsi_buy": 10, "rsi_sell": 60, "trend": 100, "stop_atr": 2.0, "target_r": 2.0, "time_stop": 8},
-            {"rsi_len": 5, "rsi_buy": 25, "rsi_sell": 70, "trend": 50, "stop_atr": 1.2, "target_r": 1.5, "time_stop": 15},
+            {"lookback": 40, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
+            {"lookback": 55, "stop_atr": 3.0, "trail_atr": 6.0, "time_stop": 400},
         ],
     },
-    "PULL": {
+    "PULLBACK": {
         "thesis": (
-            "In an established uptrend, execution algos work buy orders on dips to "
-            "the short mean so they do not pay up. Buying the dip with the trend is "
-            "buying where the patient bid actually sits."
+            "A breakout is only tradeable while price is still near the short mean. Once the move "
+            "is extended, the same breakout is the crowd's entry. Requiring the close to sit "
+            "within {ext} of the {fast}-day mean keeps the entry on the first thrust out of a "
+            "pullback and skips the chase."
         ),
-        "entry": "Buy the next open when the {fast}-day mean > {slow}-day mean and close is {dip} below the {fast}-day mean.",
-        "exit": "Exit on a close {target} above the {fast}-day mean, the ATR stop, or the {time_stop}-bar time stop.",
+        "entry": "Buy the next open when the close exceeds the prior {lookback}-day high and is "
+                 "no more than {ext} above the {fast}-day mean.",
+        "exit": "Trail a {trail_atr}× ATR chandelier stop; flatten on a close back below the "
+                "regime mean or after {time_stop} bars.",
         "grid": [
-            {"fast": 20, "slow": 100, "dip": 0.01, "target": 0.02, "stop_atr": 1.5, "target_r": 2.0, "time_stop": 15},
-            {"fast": 10, "slow": 50, "dip": 0.015, "target": 0.025, "stop_atr": 1.2, "target_r": 2.0, "time_stop": 12},
-            {"fast": 50, "slow": 200, "dip": 0.02, "target": 0.04, "stop_atr": 2.0, "target_r": 2.5, "time_stop": 30},
+            {"lookback": 10, "fast": 20, "ext": 0.02, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
+            {"lookback": 10, "fast": 50, "ext": 0.01, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
+            {"lookback": 10, "fast": 20, "ext": 0.01, "stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
         ],
     },
-    "SQZ": {
+    "TREND": {
         "thesis": (
-            "Volatility contracts when both sides are passive. The first close above "
-            "the prior bar after a contraction marks the side that blinked, and "
-            "dealers must re-hedge in that direction."
+            "The slowest expression of the same edge: be long while price holds above a rising "
+            "200-day mean, flat otherwise. Few trades, long holds, and it is the honest baseline "
+            "any faster strategy has to beat."
         ),
-        "entry": "Buy the next open after a {squeeze}-bar range contraction below {ratio}× the {base}-bar average range, when close > prior high.",
-        "exit": "Exit on a close below the prior {exit_lookback}-day low, the ATR stop, or the {time_stop}-bar time stop.",
+        "entry": "Buy the next open when the close crosses above the {regime}-day mean while that "
+                 "mean is rising.",
+        "exit": "Exit on a close back below the {regime}-day mean, the {stop_atr}× ATR stop, or "
+                "after {time_stop} bars.",
         "grid": [
-            {"squeeze": 10, "base": 60, "ratio": 0.7, "exit_lookback": 7, "stop_atr": 1.5, "target_r": 2.0, "time_stop": 15},
-            {"squeeze": 5, "base": 40, "ratio": 0.6, "exit_lookback": 5, "stop_atr": 1.2, "target_r": 1.8, "time_stop": 10},
-        ],
-    },
-    "ABS": {
-        "thesis": (
-            "A high-volume bar with a tight range is two-sided trade absorbed by a "
-            "passive participant. If the close is up, the absorber is a buyer, and "
-            "the path of least resistance is up."
-        ),
-        "entry": "Buy the next open after a bar with volume z > {vol_z} and range < {compress}× ATR that closes up.",
-        "exit": "Exit on a close below the prior {exit_lookback}-day low, the ATR stop, or the {time_stop}-bar time stop.",
-        "grid": [
-            {"vol_z": 2.0, "compress": 0.6, "exit_lookback": 7, "stop_atr": 1.5, "target_r": 2.0, "time_stop": 15},
-            {"vol_z": 2.5, "compress": 0.5, "exit_lookback": 5, "stop_atr": 1.2, "target_r": 2.0, "time_stop": 12},
-        ],
-    },
-    "SWEEP": {
-        "thesis": (
-            "A wick below a well-known low that closes back inside is stop-running: "
-            "resting sell stops became market sell orders, a buyer took them, and "
-            "the level was reclaimed. The failed break is the signal."
-        ),
-        "entry": "Buy the next open when the low pierces the prior {lookback}-day low and the close is back above it.",
-        "exit": "Exit on a close above the prior {target_lookback}-day high, the ATR stop, or the {time_stop}-bar time stop.",
-        "grid": [
-            {"lookback": 10, "target_lookback": 10, "stop_atr": 1.5, "target_r": 2.0, "time_stop": 15},
-            {"lookback": 20, "target_lookback": 20, "stop_atr": 2.0, "target_r": 2.5, "time_stop": 25},
+            {"stop_atr": 3.0, "trail_atr": 0.0, "time_stop": 400},
+            {"stop_atr": 2.0, "trail_atr": 6.0, "time_stop": 400},
         ],
     },
 }
@@ -594,15 +613,25 @@ FAMILIES: Dict[str, Dict[str, Any]] = {
 
 def _describe(spec: StrategySpec) -> StrategySpec:
     fam = FAMILIES.get(spec.family, {})
-    spec.thesis = fam.get("thesis", spec.thesis)
-    spec.entry_text = fam.get("entry", spec.entry_text).format(**{k: _fmt(v) for k, v in spec.params.items()})
-    spec.exit_text = fam.get("exit", spec.exit_text).format(**{k: _fmt(v) for k, v in spec.params.items()})
-    trail = spec.params.get("trail_atr")
+    params = {k: _fmt(v) for k, v in spec.params.items()}
+    gate = (
+        f" The regime gate requires price above a rising {int(spec.params.get('regime', 200))}-day "
+        f"mean (shorts: below a falling one), measured over {int(spec.params.get('slope_len', 20))} bars, "
+        "and the signal bar must close in the trade's half of its range."
+    )
+    spec.thesis = fam.get("thesis", spec.thesis).format(**params) + gate
+    spec.entry_text = fam.get("entry", spec.entry_text).format(**params) + gate
+    spec.exit_text = fam.get("exit", spec.exit_text).format(**params)
+
+    trail = float(spec.params.get("trail_atr", 0) or 0)
+    short_side = str(spec.params.get("direction_mode", "long")) == "long_short"
     spec.risk_text = (
-        f"Long only. Stop {spec.params.get('stop_atr', 1.5)}× ATR below entry; "
-        f"target {spec.params.get('target_r', 2.0)}R; time stop {spec.params.get('time_stop', 20)} bars; "
-        + (f"breakeven at +{spec.params.get('breakeven_r', 1.0)}R then trail {trail}× ATR; " if trail else "")
-        + f"{DEFAULT_RISK_PCT}% of equity risked per trade; {DEFAULT_COST_BPS:.0f} bps round-trip cost charged."
+        ("Long and short (shorts only in a confirmed downtrend). " if short_side
+         else "Long only: measured shorts lost money on these indices. ")
+        + f"Initial stop {spec.params.get('stop_atr', 2.0)}× ATR, "
+        + (f"trailed {trail:g}× ATR once the trade is in profit; " if trail > 0 else "not trailed; ")
+        + f"time stop {spec.params.get('time_stop', 400)} bars; "
+        + f"{DEFAULT_RISK_PCT}% of equity risked per trade; {DEFAULT_COST_BPS:.0f} bps charged per leg."
     )
     return spec
 
@@ -622,16 +651,23 @@ def _ensure_dir() -> str:
     return STRATEGY_DIR
 
 
-def render_strategy_doc(spec: StrategySpec, result: Dict[str, Any]) -> str:
+def render_strategy_doc(
+    spec: StrategySpec,
+    result: Dict[str, Any],
+    validation: Optional[Dict[str, Any]] = None,
+) -> str:
     m = result.get("metrics", {})
+    v = validation or {}
+    hold = v.get("holdout", {})
+    wf = v.get("walk_forward", {})
     status = "PASSED" if m.get("passed") else "NOT PASSED"
     lines = [
         f"# {spec.name} — {spec.family} on {spec.index_key}",
         "",
-        f"**Status:** {status}  ",
+        f"**Gate:** {status}  ",
+        f"**Validation:** {'VALIDATED' if v.get('validated') else 'NOT VALIDATED'}  ",
         f"**Generated:** {_dt.datetime.now().isoformat(timespec='seconds')}  ",
-        f"**Engine:** ZERO v{SCHEMA_VERSION} Strategy Lab  ",
-        f"**Improved from:** {spec.improved_from or '—'}",
+        f"**Engine:** ZERO v{SCHEMA_VERSION} Strategy Lab",
         "",
         "## Why this edge should exist",
         "",
@@ -652,7 +688,7 @@ def render_strategy_doc(spec: StrategySpec, result: Dict[str, Any]) -> str:
         lines.append(f"| `{key}` | {value} |")
     lines += [
         "",
-        "## Backtest result",
+        "## Backtest result (full history)",
         "",
         "| Metric | Value |",
         "|---|---|",
@@ -664,43 +700,56 @@ def render_strategy_doc(spec: StrategySpec, result: Dict[str, Any]) -> str:
         f"| Profit factor | {m.get('profit_factor', 0):.2f} |",
         f"| Expectancy (R) | {m.get('expectancy_r', 0):+.3f} |",
         f"| Max drawdown | {m.get('max_drawdown_pct', 0):.2f}% |",
-        f"| Sharpe (per-trade, sample-scaled) | {m.get('sharpe', 0):.2f} |",
         f"| Stop-out rate | {m.get('stop_rate_pct', 0):.1f}% |",
+        f"| Long / short trades | {m.get('long_trades', 0)} / {m.get('short_trades', 0)} |",
+        "",
+        "## Validation (never part of the gate)",
+        "",
+        "| Check | Value |",
+        "|---|---|",
+        f"| Holdout trades | {hold.get('trades', 0)} |",
+        f"| Holdout profit factor | {hold.get('profit_factor', 0):.2f} |",
+        f"| Holdout net P&L (₹) | {hold.get('net_pnl', 0):,.0f} |",
+        f"| Fold-consistency | {wf.get('positive_folds', 0)}/{wf.get('folds', 0)} folds positive |",
+        f"| Pooled fold profit factor | {wf.get('pooled_pf', 0):.2f} |",
         "",
         "## How to reproduce",
         "",
         "```python",
-        "from engine.v2.strategy_lab import StrategySpec, backtest, _frame",
+        "from engine.v2.strategy_lab import StrategySpec, backtest, validate, _frame",
         f"spec = StrategySpec(family='{spec.family}', index_key='{spec.index_key}', params={spec.params!r})",
         f"df = _frame('{spec.index_key}')",
         "print(backtest(df, spec)['metrics'])",
+        "print(validate(df, spec))",
         "```",
         "",
         "## Reuse",
         "",
         f"Load the spec from `strategies/index.json` under `{spec.name}` and pass it to",
-        f"`backtest()` or the v2.0 panel. The id is stable for the same parameter set.",
+        "`backtest()` or the v2.0 panel. The id is stable for the same parameter set.",
         "",
         "---",
         "_Backtests are simulations. Costs are approximated at "
-        f"{DEFAULT_COST_BPS:.0f} bps round trip and do not model gap slippage beyond "
-        "the next-open fill. Past performance is not a forecast._",
+        f"{DEFAULT_COST_BPS:.0f} bps per leg and do not model gap slippage beyond the "
+        "next-open fill. Past performance is not a forecast._",
     ]
     return "\n".join(lines)
 
 
-def render_mistakes_doc(spec: StrategySpec, result: Dict[str, Any]) -> str:
+def render_mistakes_doc(
+    spec: StrategySpec,
+    result: Dict[str, Any],
+    validation: Optional[Dict[str, Any]] = None,
+) -> str:
     m = result.get("metrics", {})
     trades = result.get("trades", []) or []
     stops = [t for t in trades if t["reason"] == "STOP"]
-    targets = [t for t in trades if t["reason"] == "TARGET"]
     losers = sorted(trades, key=lambda t: t["pnl"])[:3]
     winners = sorted(trades, key=lambda t: t["pnl"], reverse=True)[:3]
-
-    # Measured mistakes (derived from this run, not boilerplate).
-    tight_stops = [t for t in trades if t["entry_atr"] and t["stop_atr"] < 0.8 * t["entry_atr"]]
     premature = [t for t in stops if t["mfe_pts"] > 1.5 * max(1e-9, t["stop_atr"])]
-    late_entries = [t for t in trades if t["entry_atr"] and t["mae_pts"] > 0.9 * t["entry_atr"]]
+    giveback = [t for t in trades if t["mfe_pts"] > 0 and t["pnl"] < 0.25 * t["mfe_pts"] * t["qty"]]
+    v = validation or {}
+    hold = v.get("holdout", {})
 
     lines = [
         f"# _@{spec.name}_, mistakes and P&L",
@@ -719,43 +768,28 @@ def render_mistakes_doc(spec: StrategySpec, result: Dict[str, Any]) -> str:
         lines.append("- No trades were produced. The rule never fired in this window; that is a")
         lines.append("  design failure (too strict a filter), not a market failure.")
     else:
-        if tight_stops:
-            lines.append(
-                f"- **Stops inside the noise band.** {len(tight_stops)} of {len(trades)} trades "
-                f"used a stop below 0.8× the entry ATR. Those stops sit inside one normal bar's "
-                "range, so they are liquidity for other participants."
-            )
         if premature:
             lines.append(
-                f"- **Premature stop-outs.** {len(premature)} stop-outs had already run "
-                "more than 1.5× their stop distance in favour before reversing. The stop was "
-                "placed for the thesis but not for the entry timing."
+                f"- **Premature stop-outs.** {len(premature)} stop-outs had already run more than "
+                "1.5× their stop distance in favour before reversing."
             )
-        if late_entries:
+        if giveback:
             lines.append(
-                f"- **Late entries.** {len(late_entries)} trades immediately moved more than "
-                "0.9× ATR against entry. The signal was valid but the fill was chased."
+                f"- **Give-back.** {len(giveback)} trades closed below a quarter of their peak "
+                "favour. The trail is wide by design; this is the cost of letting the tail run."
             )
         if m.get("stop_rate_pct", 0) > 60:
-            lines.append(
-                f"- **Stop rate {m.get('stop_rate_pct', 0):.0f}%.** More than half the trades "
-                "were stopped. The entry filter admits too many low-quality setups."
-            )
-        if m.get("profit_factor", 0) < 1.15:
-            lines.append(
-                f"- **Profit factor {m.get('profit_factor', 0):.2f}.** Gross wins do not "
-                f"cover gross losses after {DEFAULT_COST_BPS:.0f} bps costs. Edge is absent or "
-                "smaller than friction."
-            )
-        if targets:
-            lines.append(
-                f"- **Target discipline.** {len(targets)} trades reached the {spec.params.get('target_r')}R "
-                "target. Every remaining winner was closed by signal or time, which caps the "
-                "right tail — consider a trailing stop on the runners."
-            )
-        if not (tight_stops or premature or late_entries):
-            lines.append("- No structural mistake cleared its threshold in this run. The losses are")
-            lines.append("  variance around a positive expectancy rather than a repeated error.")
+            lines.append(f"- **Stop rate {m.get('stop_rate_pct', 0):.0f}%.** The entry filter "
+                         "admits too many low-quality setups.")
+        if m.get("profit_factor", 0) < MIN_PROFIT_FACTOR:
+            lines.append(f"- **Profit factor {m.get('profit_factor', 0):.2f}.** Gross wins do not "
+                         f"cover gross losses after costs. The edge is absent or too small.")
+        if hold.get("trades") and hold.get("net_pnl", 0) <= 0:
+            lines.append(f"- **Holdout lost money:** ₹{hold.get('net_pnl', 0):,.0f} over "
+                         f"{hold.get('trades', 0)} trades. The result is history-specific.")
+        if not premature and not giveback and m.get("profit_factor", 0) >= MIN_PROFIT_FACTOR:
+            lines.append("- No structural mistake cleared its threshold. The losses are variance "
+                         "around a positive expectancy rather than a repeated error.")
 
     lines += ["", "## Trade ledger (worst 3 / best 3)", ""]
     lines.append("| Entry | Exit | Entry px | Exit px | P&L ₹ | R | Reason | MAE | MFE |")
@@ -769,20 +803,12 @@ def render_mistakes_doc(spec: StrategySpec, result: Dict[str, Any]) -> str:
         "",
         "## P&L attribution",
         "",
-        f"- Gross winners carried the result: {len([t for t in trades if t['pnl'] > 0])} winners.",
-        f"- Losers: {len([t for t in trades if t['pnl'] <= 0])}.",
+        f"- Winners: {len([t for t in trades if t['pnl'] > 0])} · losers: {len([t for t in trades if t['pnl'] <= 0])}.",
         f"- Average hold: {m.get('avg_bars_held', 0)} bars.",
         f"- Expectancy: {m.get('expectancy_r', 0):+.3f}R per trade.",
         "",
-        "## Fix list for the next iteration",
-        "",
-        "1. Widen the stop to at least 1.5× ATR and reduce size so rupee risk is unchanged.",
-        "2. Require the entry bar to close in the top third of its range (confirmation, not prediction).",
-        "3. Add a trailing stop after +1R to keep the right tail.",
-        "4. Re-test with the parameter grid; accept only if out-of-sample profit factor does not fall.",
-        "",
         "---",
-        "_Generated by ZERO v2.0 Strategy Lab. Metrics are computed from the trade ledger above._",
+        "_Generated by ZERO v2.1 Strategy Lab. Metrics are computed from the trade ledger above._",
     ]
     return "\n".join(lines)
 
@@ -794,110 +820,7 @@ def _write(path: str, text: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Improve
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _candidate_grid(spec: StrategySpec) -> List[Dict[str, float]]:
-    """Family presets plus a local perturbation search around the base params.
-
-    The presets alone mostly reproduce the base spec once merged, so the lab
-    would never actually explore. This widens the stop/target/horizon in both
-    directions and keeps every unique numeric candidate.
-    """
-    base = dict(spec.params)
-    candidates: List[Dict[str, float]] = []
-    for preset in FAMILIES.get(spec.family, {}).get("grid", []):
-        candidates.append({**base, **preset})
-
-    # Trade-management variants: breakeven at +1R and an ATR trailing stop.
-    for trail, be in ((1.5, 0.8), (2.5, 1.0), (2.0, 1.5)):
-        candidates.append({**base, "trail_atr": trail, "breakeven_r": be})
-
-    scales = (0.75, 0.9, 1.15, 1.35)
-    for key in ("stop_atr", "target_r", "time_stop", "lookback",
-                "exit_lookback", "trend", "fast", "slow", "squeeze", "rsi_buy"):
-        if key not in base:
-            continue
-        try:
-            value = float(base[key])
-        except (TypeError, ValueError):
-            continue
-        for scale in scales:
-            candidate = dict(base)
-            new_value = value * scale
-            candidate[key] = int(round(new_value)) if isinstance(base[key], int) else round(new_value, 3)
-            if candidate[key] != base[key]:
-                candidates.append(candidate)
-
-    unique: List[Dict[str, float]] = []
-    seen = set()
-    for candidate in candidates:
-        fingerprint = json.dumps(candidate, sort_keys=True)
-        if fingerprint in seen:
-            continue
-        seen.add(fingerprint)
-        unique.append(candidate)
-    return unique
-
-
-def improve(spec: StrategySpec, df, base_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Grid-search the family around a passing strategy, validated OOS.
-
-    An improvement is accepted only when the out-of-sample profit factor is at
-    least the base OOS profit factor and OOS trades >= 5. Returns the improved
-    spec/result pair, or ``None``.
-    """
-    split, n = _oos_split(df)
-    base_oos_metrics = _slice_backtest(df, spec, split, n).get("metrics", {})
-    base_oos_trades = base_oos_metrics.get("trades", 0)
-    base_oos_pf = base_oos_metrics.get("profit_factor", 0.0)
-    if base_oos_trades < 3:
-        return None
-
-    # A tiny OOS sample can report PF 99 (one winning trade). Only trust the
-    # parent's OOS PF as a bar when the sample is actually meaningful.
-    required_oos_pf = base_oos_pf if base_oos_trades >= 5 else MIN_OOS_PROFIT_FACTOR
-    base_full_pf = base_result.get("metrics", {}).get("profit_factor", 0.0)
-
-    best: Optional[Tuple[float, StrategySpec, Dict[str, Any], Dict[str, Any]]] = None
-    for params in _candidate_grid(spec):
-        candidate = _describe(StrategySpec(
-            family=spec.family,
-            index_key=spec.index_key,
-            params=params,
-            improved_from=spec.name,
-        ))
-        if candidate.name == spec.name:
-            continue
-
-        oos = _slice_backtest(df, candidate, split, n)
-        om = oos.get("metrics", {})
-        # Constraint 1: out-of-sample must not degrade.
-        if om.get("trades", 0) < 5 or om.get("profit_factor", 0) < max(required_oos_pf, MIN_OOS_PROFIT_FACTOR):
-            continue
-
-        # Constraint 2: the full sample must actually beat the parent.
-        full = backtest(df, candidate)
-        fm = full.get("metrics", {})
-        if fm.get("trades", 0) < 5 or fm.get("profit_factor", 0.0) < base_full_pf:
-            continue
-
-        score = fm.get("profit_factor", 0.0) * min(1.0, fm.get("trades", 0) / 20.0)
-        if best is None or score > best[0]:
-            best = (score, candidate, full, oos)
-
-    if best is None:
-        return None
-    _, candidate, full, oos = best
-    return {"spec": candidate, "result": full, "oos": oos}
-
-
-def _slice_backtest(df, spec: StrategySpec, start: int, end: int) -> Dict[str, Any]:
-    return backtest(df, spec, start=start, end=end)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Registry + orchestration
+#  Registry
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_registry() -> Dict[str, Any]:
@@ -909,49 +832,82 @@ def load_registry() -> Dict[str, Any]:
         return {}
 
 
+def _rank_score(metrics: Dict[str, Any]) -> float:
+    """Risk-adjusted rank used for the podium."""
+    return metrics.get("profit_factor", 0) * min(1.0, metrics.get("trades", 0) / 20.0)
+
+
 def _save_registry(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     passed = [e for e in entries if e.get("status") == "PASSED"]
-    improved = [e for e in entries if e.get("improved_from")]
-    def _rank(entry: Dict[str, Any]) -> float:
-        m = entry.get("metrics", {})
-        return m.get("profit_factor", 0) * min(1.0, m.get("trades", 0) / 20.0)
-
-    # The brief wants the top three *winners*. If nothing cleared the gate yet,
-    # report the three best candidates and label them honestly rather than
-    # showing an empty list.
-    podium = sorted(passed, key=_rank, reverse=True)[:3]
-    if not podium:
-        podium = sorted(entries, key=_rank, reverse=True)[:3]
-    top = [
-        {
-            "name": e["name"], "index": e.get("index"), "family": e.get("family"),
-            "status": e.get("status"), "metrics": e.get("metrics", {}),
-            "improved_from": e.get("improved_from", ""),
-        }
-        for e in podium
-    ]
-
+    validated = [e for e in entries if e.get("validated")]
+    podium = sorted(passed or entries, key=lambda e: _rank_score(e.get("metrics", {})), reverse=True)[:3]
     registry = {
         "schema": SCHEMA_VERSION,
         "updated_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "total": len(entries),
         "passed": len(passed),
         "failed": len(entries) - len(passed),
-        "improved": len(improved),
-        "top": top,
+        "validated": len(validated),
+        "top": [
+            {
+                "name": e["name"], "index": e.get("index"), "family": e.get("family"),
+                "status": e.get("status"), "metrics": e.get("metrics", {}),
+                "validated": e.get("validated", False),
+            }
+            for e in podium
+        ],
         "strategies": entries,
     }
     _write(REGISTRY_PATH, json.dumps(registry, indent=2, default=str))
     return registry
 
 
+def _prune_orphans(names: set) -> None:
+    """Delete generated docs that no longer belong to a current spec, so the
+    folder always matches the registry after a family/grid change."""
+    try:
+        for fname in os.listdir(STRATEGY_DIR):
+            if not fname.endswith(".md"):
+                continue
+            keep = (fname.startswith("_@") and any(f"@{n}_," in fname for n in names)) or (
+                not fname.startswith("_@") and fname[:-3] in names
+            )
+            if not keep:
+                os.remove(os.path.join(STRATEGY_DIR, fname))
+    except OSError:
+        pass
+
+
+def _persist_run(spec: StrategySpec, result: Dict[str, Any], validation: Dict[str, Any]) -> Dict[str, Any]:
+    """Write a strategy's two documents and build its registry entry."""
+    doc_path = os.path.join(STRATEGY_DIR, f"{spec.name}.md")
+    mistakes_path = os.path.join(STRATEGY_DIR, f"_@{spec.name}_, mistakes and P&L.md")
+    _write(doc_path, render_strategy_doc(spec, result, validation))
+    _write(mistakes_path, render_mistakes_doc(spec, result, validation))
+
+    m = result.get("metrics", {})
+    return {
+        "name": spec.name,
+        "family": spec.family,
+        "index": spec.index_key,
+        "status": "PASSED" if m.get("passed") else "NOT_PASSED",
+        "validated": bool(validation.get("validated")),
+        "params": spec.params,
+        "metrics": m,
+        "holdout": validation.get("holdout", {}),
+        "walk_forward": validation.get("walk_forward", {}),
+        "doc": doc_path.replace("\\", "/"),
+        "mistakes_doc": mistakes_path.replace("\\", "/"),
+        "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def run_lab(
     indices: Tuple[str, ...] = ("NIFTY", "SENSEX"),
     families: Tuple[str, ...] = tuple(FAMILIES.keys()),
-    improve_winners: bool = True,
-    max_improvements: int = 3,
+    refresh_data: bool = False,
 ) -> Dict[str, Any]:
-    """Generate, backtest, document and (optionally) improve strategies.
+    """Generate, backtest, validate and document every family preset.
 
     Returns the registry plus a run summary. Never raises: a missing index or a
     failed family is recorded as a skipped entry.
@@ -961,8 +917,8 @@ def run_lab(
     skipped: List[Dict[str, str]] = []
 
     for index_key in indices:
-        df = _frame(index_key)
-        if df is None or len(df) < 160:
+        df = _frame(index_key, refresh=refresh_data)
+        if df is None or len(df) < 300:
             skipped.append({"index": index_key, "reason": "history unavailable or too short"})
             continue
         for family in families:
@@ -970,80 +926,13 @@ def run_lab(
                 spec = _describe(StrategySpec(family=family, index_key=index_key, params=dict(params)))
                 try:
                     result = backtest(df, spec)
+                    validation = validate(df, spec)
                 except Exception as exc:
                     skipped.append({"index": index_key, "family": family, "reason": str(exc)[:120]})
                     continue
-                m = result.get("metrics", {})
-                status = "PASSED" if m.get("passed") else "NOT_PASSED"
-                doc_path = os.path.join(STRATEGY_DIR, f"{spec.name}.md")
-                mistakes_path = os.path.join(STRATEGY_DIR, f"_@{spec.name}_, mistakes and P&L.md")
-                _write(doc_path, render_strategy_doc(spec, result))
-                _write(mistakes_path, render_mistakes_doc(spec, result))
-                entries.append({
-                    "name": spec.name,
-                    "family": family,
-                    "index": index_key,
-                    "status": status,
-                    "params": spec.params,
-                    "metrics": m,
-                    "doc": doc_path.replace("\\", "/"),
-                    "mistakes_doc": mistakes_path.replace("\\", "/"),
-                    "improved_from": "",
-                    "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
-                })
+                entries.append(_persist_run(spec, result, validation))
 
-    # Improvement pass over the best strategies by risk-adjusted rank.
-    # Passing strategies get priority, but near-misses are improved too: an
-    # honest lab keeps iterating on the best available idea instead of sitting
-    # idle when nothing has cleared the gate yet.
-    if improve_winners:
-        def _rank_entry(e: Dict[str, Any]) -> float:
-            m = e.get("metrics", {})
-            score = m.get("profit_factor", 0) * min(1.0, m.get("trades", 0) / 20.0)
-            return score + (0.5 if e.get("status") == "PASSED" else 0.0)
-
-        winners = sorted(entries, key=_rank_entry, reverse=True)[:max_improvements]
-        for entry in winners:
-            df = _frame(entry["index"])
-            if df is None:
-                continue
-            spec = StrategySpec(
-                family=entry["family"], index_key=entry["index"],
-                params=entry["params"], name=entry["name"],
-            )
-            try:
-                base = backtest(df, spec)
-                upgraded = improve(spec, df, base)
-            except Exception as exc:
-                skipped.append({"index": entry["index"], "family": entry["family"],
-                                "reason": f"improve failed: {exc}"[:120]})
-                continue
-            if not upgraded:
-                continue
-            child = upgraded["spec"]
-            child.improved_from = entry["name"]
-            child.name = make_name(child.family, child.index_key, {**child.params, "_impr": 1})
-            child = _describe(child)
-            child_result = upgraded["result"]
-            doc_path = os.path.join(STRATEGY_DIR, f"{child.name}.md")
-            mistakes_path = os.path.join(STRATEGY_DIR, f"_@{child.name}_, mistakes and P&L.md")
-            _write(doc_path, render_strategy_doc(child, child_result))
-            _write(mistakes_path, render_mistakes_doc(child, child_result))
-            cm = child_result.get("metrics", {})
-            entries.append({
-                "name": child.name,
-                "family": child.family,
-                "index": child.index_key,
-                "status": "PASSED" if cm.get("passed") else "NOT_PASSED",
-                "params": child.params,
-                "metrics": cm,
-                "doc": doc_path.replace("\\", "/"),
-                "mistakes_doc": mistakes_path.replace("\\", "/"),
-                "improved_from": entry["name"],
-                "oos": upgraded["oos"].get("metrics", {}),
-                "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
-            })
-
+    _prune_orphans({e["name"] for e in entries})
     registry = _save_registry(entries)
     return {
         "schema": SCHEMA_VERSION,
@@ -1051,7 +940,7 @@ def run_lab(
         "skipped": skipped,
         "created": len(entries),
         "passed": registry["passed"],
-        "improved": registry["improved"],
+        "validated": registry["validated"],
         "top": registry["top"],
     }
 

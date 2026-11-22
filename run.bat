@@ -2,6 +2,14 @@
 cd /d "%~dp0"
 
 :: --- Runtime env defaults (no secrets required) ---
+:: REA 6.10.1 needs Node >=24.22.1. Prefer the verified portable runtime when
+:: the machine-wide install is older (see setup_node_runtime.ps1).
+set "ZERO_NODE_DIR=%LOCALAPPDATA%\Programs\node-v24.22.3\node-v24.22.3-win-x64"
+if exist "%ZERO_NODE_DIR%\node.exe" (
+    set "PATH=%ZERO_NODE_DIR%;%PATH%"
+) else (
+    set "ZERO_NODE_DIR="
+)
 set "TOKENIZERS_PARALLELISM=false"
 set "HF_HUB_DISABLE_TELEMETRY=1"
 set "STREAMLIT_SERVER_FILE_WATCHER_TYPE=poll"

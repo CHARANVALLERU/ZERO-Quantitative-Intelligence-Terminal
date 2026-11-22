@@ -41,7 +41,7 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 SCHEMA_VERSION = "2.0"
 
@@ -80,8 +80,27 @@ MIN_CONFIDENCE_TO_APPLY = 0.35
 INPUT_STORE = os.path.join("db", "v2", "macro_inputs.json")
 SNAPSHOT_STORE = os.path.join("db", "v2", "macro_snapshot.json")
 
-# Sources the snapshot expects. Used for the "aggregation" coverage score.
-_REQUIRED_MARKET = ("crude_usd", "gold_usd", "dxy", "usdinr")
+# Manual-only fields: no live feed, so these come from macro_inputs.json and
+# fall back to the previous snapshot (without flagging it stale).
+_MANUAL_FIELDS = (
+    "cpi_yoy_pct", "fed_funds_pct", "repo_rate_pct", "supply_gap_pct",
+    "nifty_cagr_pct", "sensex_cagr_pct", "earnings_growth_pct",
+)
+_TONE_FIELDS = ("acquisition_score", "policy_tone", "insider_tone")
+
+# Which INDEX_TILT multiplier applies to each channel. Unlisted channels use 1.0.
+_TILT_GROUP = {
+    "policy_rate": "rates",
+    "inflation_valuation": "rates",
+    "inflation_momentum": "rates",
+    "inflation_nominal_earnings": "rates",
+    "cagr": "cagr",
+    "crude": "crude",
+    "supply_balance": "crude",
+    "dxy": "dxy",
+    "usdinr": "dxy",
+    "gold": "dxy",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -279,6 +298,49 @@ def _download_last_close(symbols: Iterable[str]) -> Dict[str, float]:
     return out
 
 
+def _carry(
+    snap: MacroSnapshot,
+    prov: Dict[str, str],
+    manual: Dict[str, Any],
+    prev: Optional[MacroSnapshot],
+    name: str,
+    *,
+    live: Optional[float] = None,
+    clamp: bool = False,
+    stale_on_carry: bool = False,
+    provenance_on_carry: bool = True,
+    prev_default: Optional[float] = None,
+) -> None:
+    """Resolve one field: live -> manual -> previous snapshot.
+
+    The precedence and the bookkeeping it produces (provenance, the stale
+    flag) are the contract; callers only choose which sources apply.
+    """
+    if live is not None:
+        setattr(snap, name, live)
+        prov[name] = "yfinance"
+        return
+
+    value = _num(manual.get(name))
+    if value is not None:
+        setattr(snap, name, _clamp(value) if clamp else value)
+        prov[name] = str(manual.get(f"{name}_source") or "macro_inputs.json")
+        return
+
+    if prev is None:
+        return
+    carried = getattr(prev, name, None)
+    if carried is None:
+        if prev_default is not None:
+            setattr(snap, name, prev_default)
+        return
+    setattr(snap, name, carried)
+    if provenance_on_carry:
+        prov[name] = "last_snapshot"
+    if stale_on_carry:
+        snap.stale = True
+
+
 def fetch_snapshot(allow_network: bool = True) -> MacroSnapshot:
     """Assemble a snapshot from live quotes + the manual input store.
 
@@ -302,43 +364,15 @@ def fetch_snapshot(allow_network: bool = True) -> MacroSnapshot:
         notes=notes,
     )
 
-    # Market observables: live -> manual -> previous snapshot.
     for name in _YF_SYMBOLS:
-        value = live.get(name)
-        if value is not None:
-            setattr(snap, name, value)
-            prov[name] = "yfinance"
-            continue
-        value = _num(manual.get(name))
-        if value is not None:
-            setattr(snap, name, value)
-            prov[name] = "macro_inputs.json"
-            continue
-        if prev is not None and getattr(prev, name, None) is not None:
-            setattr(snap, name, getattr(prev, name))
-            prov[name] = "last_snapshot"
-            snap.stale = True
-
-    # Manual macro fields.
-    for name in (
-        "cpi_yoy_pct", "fed_funds_pct", "repo_rate_pct", "supply_gap_pct",
-        "nifty_cagr_pct", "sensex_cagr_pct", "earnings_growth_pct",
-    ):
-        value = _num(manual.get(name))
-        if value is not None:
-            setattr(snap, name, value)
-            prov[name] = str(manual.get(f"{name}_source") or "macro_inputs.json")
-        elif prev is not None and getattr(prev, name, None) is not None:
-            setattr(snap, name, getattr(prev, name))
-            prov[name] = "last_snapshot"
-
-    for name in ("acquisition_score", "policy_tone", "insider_tone"):
-        value = _num(manual.get(name))
-        if value is not None:
-            setattr(snap, name, _clamp(value))
-            prov[name] = str(manual.get(f"{name}_source") or "macro_inputs.json")
-        elif prev is not None:
-            setattr(snap, name, getattr(prev, name, 0.0))
+        _carry(snap, prov, manual, prev, name, live=live.get(name), stale_on_carry=True)
+    for name in _MANUAL_FIELDS:
+        _carry(snap, prov, manual, prev, name)
+    for name in _TONE_FIELDS:
+        _carry(
+            snap, prov, manual, prev, name,
+            clamp=True, provenance_on_carry=False, prev_default=0.0,
+        )
 
     age = _age_hours(str(manual.get("updated_at") or ""))
     if age is not None and age > 72:
@@ -452,17 +486,7 @@ def analyze(
     for index, tilt in INDEX_TILT.items():
         total = 0.0
         for channel, value in contrib.items():
-            if channel in ("policy_rate", "inflation_valuation", "inflation_momentum",
-                           "inflation_nominal_earnings"):
-                total += value * tilt["rates"]
-            elif channel in ("cagr",):
-                total += value * tilt["cagr"]
-            elif channel in ("crude", "supply_balance"):
-                total += value * tilt["crude"]
-            elif channel in ("dxy", "usdinr", "gold"):
-                total += value * tilt["dxy"]
-            else:
-                total += value
+            total += value * tilt.get(_TILT_GROUP.get(channel, ""), 1.0)
         net[index] = round(max(-MAX_TOTAL_PCT, min(MAX_TOTAL_PCT, total)), 4)
 
     # ── Confidence ─────────────────────────────────────────────────────────
@@ -484,8 +508,7 @@ def analyze(
     audit: List[Dict[str, Any]] = []
     audit.append(_audit_pair(
         1, "Crude up -> dollar down, equities down",
-        crude_pct, dxy_pct, expect_same_sign=False, invert=False,
-        extra_ok=(contrib.get("crude", 0.0) <= 0),
+        crude_pct, dxy_pct, extra_ok=(contrib.get("crude", 0.0) <= 0),
     ))
     if infl_gap is not None:
         observed = (
@@ -500,8 +523,7 @@ def analyze(
         audit.append(_rule(2, "Inflation up -> rates up -> equities down", "CPI not observed", "INSUFFICIENT DATA"))
     audit.append(_audit_pair(
         3, "Gold up -> dollar down, equities down",
-        gold_pct, dxy_pct, expect_same_sign=False, invert=False,
-        extra_ok=(contrib.get("gold", 0.0) <= 0),
+        gold_pct, dxy_pct, extra_ok=(contrib.get("gold", 0.0) <= 0),
     ))
     if crude_pct is not None and gold_pct is not None:
         same = (crude_pct > 0) == (gold_pct > 0)
@@ -524,8 +546,7 @@ def analyze(
         audit.append(_rule(5, "Crude reflects global supply balance", "supply_gap_pct not set", "INSUFFICIENT DATA"))
     audit.append(_audit_pair(
         6, "Gold up with inflation, against dollar and equities (when unopposed)",
-        gold_pct, dxy_pct, expect_same_sign=False, invert=False,
-        extra_ok=(contrib.get("gold", 0.0) <= 0),
+        gold_pct, dxy_pct, extra_ok=(contrib.get("gold", 0.0) <= 0),
     ))
     audit.append(_rule(
         7, "CPI is a primary inflation input",
@@ -595,17 +616,13 @@ def _audit_pair(
     statement: str,
     a: Optional[float],
     b: Optional[float],
-    expect_same_sign: bool,
-    invert: bool,
     extra_ok: bool = True,
 ) -> Dict[str, Any]:
+    """Audit a stated *inverse* relationship (rule 1/3/6 all state "up -> down")."""
     if a is None or b is None:
         return _rule(rule, statement, "inputs missing", "INSUFFICIENT DATA")
     same = (a > 0) == (b > 0)
-    matches = same if expect_same_sign else (not same)
-    if invert:
-        matches = not matches
-    ok = matches and extra_ok
+    ok = (not same) and extra_ok
     return _rule(
         rule,
         statement,
@@ -719,23 +736,16 @@ def apply_macro_overlay(
         cap = float(MAX_PREDICTION_RANGE.get(index, 2000))
 
         new = dict(data)
-        for leg in ("pred_open", "pred_close"):
+        # open/close shift with the level; high/low also widen by half the
+        # shift, because fresh macro information is a variance event.
+        for leg, widen_sign in (("pred_open", 0), ("pred_close", 0),
+                                ("pred_high", 1), ("pred_low", -1)):
             if new.get(leg) is None:
                 continue
             try:
-                val = float(new[leg]) + shift
+                val = float(new[leg]) + shift + widen_sign * widen
             except (TypeError, ValueError):
                 continue
-            val = max(spot - cap, min(spot + cap, val))
-            new[leg] = round(val, 2)
-        for leg in ("pred_high", "pred_low"):
-            if new.get(leg) is None:
-                continue
-            try:
-                val = float(new[leg]) + shift
-            except (TypeError, ValueError):
-                continue
-            val = val + widen if leg == "pred_high" else val - widen
             val = max(spot - cap, min(spot + cap, val))
             new[leg] = round(val, 2)
         new["macro_shift_points"] = round(shift, 1)

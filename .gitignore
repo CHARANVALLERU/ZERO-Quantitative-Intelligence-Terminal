@@ -78,3 +78,21 @@ Jenkinsfile
 # Composer/PHP
 composer.lock
 vendor/
+
+# ── ZERO v2 runtime state (regenerated, machine-local) ───────────────────────
+db/v2/cache/
+db/v2/rea_tools.json
+db/v2/quotes_cache.json
+db/v2/session_brief.json
+db/v2/research/
+db/v2/*.tmp
+db/v2/*.corrupt
+
+# Local SQLite / journals
+zero_terminal.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Generated strategy scratch files (docs + index are kept on purpose)
+strategies/*.tmp

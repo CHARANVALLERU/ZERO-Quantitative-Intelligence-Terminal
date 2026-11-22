@@ -6,7 +6,7 @@ Usage (from the project root):
 
     python -m engine.v2 status
     python -m engine.v2 macro            # refresh + analyse the macro graph
-    python -m engine.v2 lab --no-improve # generate/backtest strategies
+    python -m engine.v2 lab            # generate/backtest/validate strategies
     python -m engine.v2 research         # run the institutional desks
     python -m engine.v2 audit --repair   # integrity audit (and safe repairs)
     python -m engine.v2 rea-probe        # discover REA MCP tools
@@ -58,13 +58,13 @@ def cmd_macro(allow_network: bool) -> int:
     return 0
 
 
-def cmd_lab(improve: bool) -> int:
+def cmd_lab(refresh: bool) -> int:
     from engine.v2 import strategy_lab
-    result = strategy_lab.run_lab(improve_winners=improve)
+    result = strategy_lab.run_lab(refresh_data=refresh)
     _print({
         "created": result["created"],
         "passed": result["passed"],
-        "improved": result["improved"],
+        "validated": result["validated"],
         "skipped": result["skipped"],
         "top": result["top"],
     })
@@ -120,7 +120,7 @@ def main(argv=None) -> int:
     p_macro.add_argument("--offline", action="store_true", help="use the input store only")
 
     p_lab = sub.add_parser("lab", help="generate, backtest and document strategies")
-    p_lab.add_argument("--no-improve", action="store_true", help="skip the improvement pass")
+    p_lab.add_argument("--refresh", action="store_true", help="re-download the price cache")
 
     sub.add_parser("research", help="run the institutional research desks")
     sub.add_parser("rea-probe", help="discover the REA MCP tool catalogue")
@@ -135,7 +135,7 @@ def main(argv=None) -> int:
     if args.command == "macro":
         return cmd_macro(allow_network=not args.offline)
     if args.command == "lab":
-        return cmd_lab(improve=not args.no_improve)
+        return cmd_lab(refresh=args.refresh)
     if args.command == "research":
         return cmd_research()
     if args.command == "audit":
