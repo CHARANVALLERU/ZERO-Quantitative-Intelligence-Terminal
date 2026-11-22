@@ -31,6 +31,13 @@ db/aite_build_progress.json
 db/agent_decisions.jsonl
 db/india_vix_last.json
 db/okf_financial_chroma/
+db/pit/
+db/options/
+db/broker/
+db/v2/shadow_signals.jsonl
+db/v2/shadow_scores.jsonl
+db/v2/alerts.jsonl
+db/v2/lab_diagnostics.json
 db/self_learning_quant_weights.json
 db/spike_execution_audit.json
 db/spike_execution_audit.json.lock
@@ -71,7 +78,7 @@ docker-compose.*.local
 docker-compose.dev.yml
 
 # CI/CD
-.github/
+# .github/ is tracked so the integrity workflow runs on PRs.
 .gitlab-ci.yml
 Jenkinsfile
 

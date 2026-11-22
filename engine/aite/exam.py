@@ -3,6 +3,16 @@ ZERO AITE OOS examination / walk-forward backtest engine.
 
 Produces ~40 progress lines for UI sync, trade tables (name, entry, exit,
 entry time, exit time), and pass/fail gates against OOS Sharpe / drawdown.
+
+INTEGRITY CONTRACT (added 2026-11-22)
+-------------------------------------
+A promotion decision may only be made on **real, timestamped OHLCV**. The
+loader no longer pads a short real series with synthetic random-walk bars, and
+it no longer falls back to a fully synthetic frame unless the caller explicitly
+passes ``allow_synthetic=True`` (UI demos / mechanics tests). Every frame
+carries a tagged ``Provenance`` (see ``engine.data_provenance``) which is
+written into the exam result, so a stored survivor can always be traced back to
+the bars that produced it.
 """
 from __future__ import annotations
 
@@ -12,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from engine import data_provenance as prov_mod
 from engine.aite import config as cfg
 from engine.aite.indicators import combined_signal, compute_features
 from engine.aite.models import BotGenome, ExamResult
@@ -127,7 +138,7 @@ def _simulate(
                 pos = 0
                 continue
 
-        # Flat → maybe enter
+        # Flat -> maybe enter
         if pos == 0 and sig[i] != 0:
             pos = int(sig[i])
             entry_i = i
@@ -146,7 +157,8 @@ def _simulate(
     return trades, equity, rets
 
 
-def _progress_lines(genome: BotGenome, n_bars: int, n_is: int, n_oos: int, stage: str, detail: str = "") -> List[str]:
+def _progress_lines(genome: BotGenome, n_bars: int, n_is: int, n_oos: int, stage: str,
+                    detail: str = "", data_source: str = "") -> List[str]:
     """Generate exactly BACKTEST_FLOW_LINES narrative lines for UI sync."""
     total = cfg.BACKTEST_FLOW_LINES
     template = [
@@ -154,42 +166,42 @@ def _progress_lines(genome: BotGenome, n_bars: int, n_is: int, n_oos: int, stage
         f"[02] SYMBOL={genome.symbol} STYLE={genome.style} GEN={genome.generation}",
         f"[03] RULES={len(genome.rules)} STOP_ATR={genome.stop_atr} TAKE_ATR={genome.take_atr}",
         f"[04] SIDE_BIAS={genome.side_bias} HOLD_BARS={genome.hold_bars}",
-        f"[05] LOAD bars → {n_bars} rows available",
-        f"[06] FEATURE ENGINE: RSI MACD BB ATR EMA MOM STOCH ADX CCI VWAP",
+        f"[05] LOAD bars → {n_bars} rows available | DATA={data_source or 'unknown'}",
+        "[06] FEATURE ENGINE: RSI MACD BB ATR EMA MOM STOCH ADX CCI VWAP",
         f"[07] SPLIT IS={n_is} bars ({cfg.IS_FRAC:.0%}) | OOS={n_oos} bars ({cfg.OOS_FRAC:.0%})",
         f"[08] COST MODEL: commission={cfg.COMMISSION_BPS}bps slip={cfg.SLIPPAGE_BPS}bps",
-        f"[09] BEGIN in-sample simulation…",
-        f"[10] IS: warm-up indicators (30 bars)",
+        "[09] BEGIN in-sample simulation…",
+        "[10] IS: warm-up indicators (30 bars)",
         f"[11] IS: signal voting across {len(genome.rules)} rules",
-        f"[12] IS: ATR stop/take placement active",
-        f"[13] IS: time-stop + flip exits armed",
-        f"[14] IS: equity curve accumulating",
-        f"[15] IS: trade blotter writing fills",
-        f"[16] IS: sharpe / hit-rate interim",
-        f"[17] IS: max drawdown checkpoint",
-        f"[18] IS: complete — handoff to OOS",
-        f"[19] FREEZE parameters (no re-fit)",
-        f"[20] BEGIN out-of-sample simulation…",
-        f"[21] OOS: fresh feature window",
-        f"[22] OOS: signal replay (no look-ahead)",
-        f"[23] OOS: risk exits identical to IS",
-        f"[24] OOS: equity curve accumulating",
-        f"[25] OOS: trade blotter writing fills",
-        f"[26] OOS: sharpe computation",
+        "[12] IS: ATR stop/take placement active",
+        "[13] IS: time-stop + flip exits armed",
+        "[14] IS: equity curve accumulating",
+        "[15] IS: trade blotter writing fills",
+        "[16] IS: sharpe / hit-rate interim",
+        "[17] IS: max drawdown checkpoint",
+        "[18] IS: complete — handoff to OOS",
+        "[19] FREEZE parameters (no re-fit)",
+        "[20] BEGIN out-of-sample simulation…",
+        "[21] OOS: fresh feature window",
+        "[22] OOS: signal replay (no look-ahead)",
+        "[23] OOS: risk exits identical to IS",
+        "[24] OOS: equity curve accumulating",
+        "[25] OOS: trade blotter writing fills",
+        "[26] OOS: sharpe computation",
         f"[27] OOS: drawdown gate check (max {cfg.MAX_OOS_DRAWDOWN:.0%})",
         f"[28] OOS: min-trades gate (need ≥ {cfg.MIN_TRADES_OOS})",
         f"[29] OOS: min-sharpe gate (need ≥ {cfg.MIN_OOS_SHARPE})",
         f"[30] COMPOSITE fitness = {cfg.IS_WEIGHT}*IS + {cfg.OOS_WEIGHT}*OOS",
-        f"[31] CORRELATION fingerprint (returns series)",
-        f"[32] REGIME stress: TREND / RANGE / HIGH_VOL tags",
-        f"[33] SLIPPAGE stress: +50% cost sensitivity",
-        f"[34] SURVIVORSHIP: status candidate→exam",
-        f"[35] VERDICT assembly…",
+        "[31] CORRELATION fingerprint (calendar-aligned returns)",
+        "[32] REGIME stress: TREND / RANGE / HIGH_VOL tags",
+        "[33] SLIPPAGE stress: +50% cost sensitivity",
+        "[34] SURVIVORSHIP: data provenance verified before promotion",
+        "[35] VERDICT assembly…",
         f"[36] STAGE={stage}",
         f"[37] DETAIL={detail or 'n/a'}",
-        f"[38] PERSIST exam cache row",
-        f"[39] EMIT trade table (name/entry/exit/times)",
-        f"[40] DONE — ready for portfolio admission",
+        "[38] PERSIST exam cache row",
+        "[39] EMIT trade table (name/entry/exit/times)",
+        "[40] DONE — ready for portfolio admission",
     ]
     # pad/trim exactly
     while len(template) < total:
@@ -197,15 +209,25 @@ def _progress_lines(genome: BotGenome, n_bars: int, n_is: int, n_oos: int, stage
     return template[:total]
 
 
+def synthetic_allowed() -> bool:
+    """
+    Test-only escape hatch. Never enable in a running book: even when this is
+    on, a synthetic exam can produce metrics but can never pass the gate.
+    """
+    import os
+    return os.environ.get("ZERO_AITE_ALLOW_SYNTHETIC", "0") == "1"
+
+
 def run_exam(
     genome: BotGenome,
     df: pd.DataFrame,
     commission_bps: float | None = None,
     slippage_bps: float | None = None,
+    allow_synthetic: bool | None = None,
 ) -> ExamResult:
     """Full IS/OOS exam for one genome. Never raises."""
     try:
-        return _run_exam_inner(genome, df, commission_bps, slippage_bps)
+        return _run_exam_inner(genome, df, commission_bps, slippage_bps, allow_synthetic)
     except Exception as exc:  # noqa: BLE001
         lines = _progress_lines(genome, 0, 0, 0, "ERROR", str(exc)[:120])
         return ExamResult(
@@ -225,18 +247,23 @@ def run_exam(
         )
 
 
-def _run_exam_inner(genome, df, commission_bps, slippage_bps) -> ExamResult:
+def _run_exam_inner(genome, df, commission_bps, slippage_bps, allow_synthetic=None) -> ExamResult:
     commission_bps = cfg.COMMISSION_BPS if commission_bps is None else commission_bps
     slippage_bps = cfg.SLIPPAGE_BPS if slippage_bps is None else slippage_bps
+    allow_synth = synthetic_allowed() if allow_synthetic is None else bool(allow_synthetic)
 
-    feats = compute_features(df)
+    prov = prov_mod.frame_provenance(df)
+
+    feats = compute_features(df) if df is not None and len(df) else pd.DataFrame()
     if feats.empty or len(feats) < cfg.MIN_BARS:
-        lines = _progress_lines(genome, len(df) if df is not None else 0, 0, 0, "REJECT", "insufficient bars")
+        lines = _progress_lines(genome, len(df) if df is not None else 0, 0, 0,
+                                "REJECT", "insufficient bars", prov.summary())
         return ExamResult(
             bot_id=genome.bot_id, passed=False,
             is_sharpe=0, oos_sharpe=0, is_return=0, oos_return=0, max_dd=1,
             n_trades_is=0, n_trades_oos=0, hit_rate_oos=0, fitness=0,
             reason="insufficient_bars", progress_lines=lines,
+            data_source=prov.source, data_provenance=prov.as_dict(),
         )
 
     times = _timestamps(df if df is not None else feats)
@@ -270,20 +297,30 @@ def _run_exam_inner(genome, df, commission_bps, slippage_bps) -> ExamResult:
     oos_comp = oos_sharpe * (1.0 + max(oos_ret, -0.5)) / (1.0 + max_dd)
     fitness = cfg.IS_WEIGHT * is_comp + cfg.OOS_WEIGHT * oos_comp
 
+    # ── provenance gate: statistics are necessary, real data is mandatory ────
+    promotable, prov_reason = prov_mod.is_promotable(prov, cfg.MIN_BARS)
+
     passed = (
         n_oos >= cfg.MIN_TRADES_OOS
         and oos_sharpe >= cfg.MIN_OOS_SHARPE
         and max_dd <= cfg.MAX_OOS_DRAWDOWN
         and oos_ret > -0.05
+        and promotable
     )
-    reason = "PASS" if passed else (
-        f"FAIL n_oos={n_oos} sharpe={oos_sharpe:.2f} dd={max_dd:.2%} ret={oos_ret:.2%}"
-    )
+    if passed:
+        reason = "PASS"
+    elif not promotable and not allow_synth:
+        reason = prov_reason
+    elif not promotable:
+        reason = f"{prov_reason} (metrics only, demo mode)"
+    else:
+        reason = f"FAIL n_oos={n_oos} sharpe={oos_sharpe:.2f} dd={max_dd:.2%} ret={oos_ret:.2%}"
 
     lines = _progress_lines(
         genome, n, split, n - split,
         "PASS" if passed else "FAIL",
-        f"oos_sharpe={oos_sharpe:.3f} fitness={fitness:.3f}",
+        f"oos_sharpe={oos_sharpe:.3f} fitness={fitness:.3f} data={prov.source}",
+        prov.summary(),
     )
 
     return ExamResult(
@@ -302,6 +339,8 @@ def _run_exam_inner(genome, df, commission_bps, slippage_bps) -> ExamResult:
         fitness=round(float(fitness), 4),
         reason=reason,
         progress_lines=lines,
+        data_source=prov.source,
+        data_provenance=prov.as_dict(),
     )
 
 
@@ -362,7 +401,10 @@ def _normalize_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
 def _pad_with_synthetic(df: pd.DataFrame, bars: int, symbol: str) -> pd.DataFrame:
     """
     Prepend synthetic older bars so recent real OHLC stays at the end.
-    Last-resort only — caller must log.
+
+    DEMO/DEGRADED MODE ONLY. The result is tagged ``mixed`` and can never pass
+    the exam gate; ``load_market_frame`` will not call this unless
+    ``allow_synthetic=True``.
     """
     need = max(0, bars - len(df))
     if need <= 0:
@@ -382,20 +424,30 @@ def _pad_with_synthetic(df: pd.DataFrame, bars: int, symbol: str) -> pd.DataFram
             first_ts = pd.Timestamp(df["timestamps"].iloc[0])
             synth["timestamps"] = pd.bdate_range(end=first_ts - pd.Timedelta(days=1), periods=need)
         except Exception:
-            pass
+            logger.warning("could not synthesise timestamps for %s", symbol)
     merged = pd.concat([synth, df], ignore_index=True)
-    return merged.tail(bars).reset_index(drop=True)
+    merged = merged.tail(bars).reset_index(drop=True)
+    return prov_mod.tag_frame(
+        merged, source=prov_mod.MIXED, vendor="synthetic_pad", symbol=symbol,
+        real_rows=len(df),
+        note="synthetic prefix prepended to a short real series (demo mode)",
+    )
 
 
-def load_market_frame(symbol: str, bars: int | None = None) -> pd.DataFrame:
+def load_market_frame(symbol: str, bars: int | None = None,
+                      allow_synthetic: bool = False) -> pd.DataFrame:
     """
     Fetch OHLCV via ZERO historical adapters with enough history for OOS exams.
 
     Preference order:
-      1. data.historical.get_historical_data with a period covering ``bars``
+      1. ``data.historical.get_historical_data`` with a period covering ``bars``
       2. direct yfinance download (2y+)
-      3. synthetic pad of a short real series (logged) — last resort
-      4. full synthetic frame (offline / total API failure)
+      3. **nothing** - an unverified empty frame is returned
+
+    Steps 1-2 are tagged ``real``. A short real series is returned as-is
+    (tagged real but short) so the exam can reject it honestly; it is only
+    padded with synthetic bars when ``allow_synthetic=True``, and the padded
+    frame is tagged ``mixed`` and can never pass promotion.
     """
     bars = int(bars or cfg.DEFAULT_BARS)
     bars = max(bars, cfg.TARGET_BARS, cfg.MIN_BARS)
@@ -410,6 +462,10 @@ def load_market_frame(symbol: str, bars: int | None = None) -> pd.DataFrame:
             if short_real is None or len(frame) > len(short_real):
                 short_real = frame
 
+    def _accept(df: pd.DataFrame, vendor: str) -> pd.DataFrame:
+        prov_mod.tag_frame(df, source=prov_mod.REAL, vendor=vendor, symbol=symbol)
+        return df.tail(bars).copy() if len(df) > bars else df.copy()
+
     # 1) ZERO historical adapter with explicit long period (not default 60d)
     try:
         from data.historical import get_historical_data
@@ -421,7 +477,7 @@ def load_market_frame(symbol: str, bars: int | None = None) -> pd.DataFrame:
                     "AITE load_market_frame(%s): got %d real bars (want %d) via historical period=%s",
                     symbol, len(df), bars, period,
                 )
-            return df.tail(bars).copy() if len(df) > bars else df.copy()
+            return _accept(df, "data.historical")
         _keep_if_short(df)
         if len(df) > 0:
             logger.warning(
@@ -448,7 +504,7 @@ def load_market_frame(symbol: str, bars: int | None = None) -> pd.DataFrame:
                     "AITE load_market_frame(%s): got %d real bars (want %d) via yfinance period=%s",
                     symbol, len(df), bars, yf_period,
                 )
-            return df.tail(bars).copy() if len(df) > bars else df.copy()
+            return _accept(df, "yfinance")
         _keep_if_short(df)
         if len(df) > 0:
             logger.warning(
@@ -458,23 +514,44 @@ def load_market_frame(symbol: str, bars: int | None = None) -> pd.DataFrame:
     except Exception as exc:  # noqa: BLE001
         logger.debug("AITE yfinance load failed for %s: %s", symbol, exc)
 
-    # 3) Pad short real series (last resort)
+    # 3) Short real series: return it honestly, pad only on explicit request.
     if short_real is not None and len(short_real) > 0:
+        if allow_synthetic:
+            logger.warning(
+                "AITE load_market_frame(%s): DEMO MODE - padding short real series (%d bars) "
+                "with synthetic history to reach %d", symbol, len(short_real), bars,
+            )
+            return _pad_with_synthetic(short_real, bars, symbol)
         logger.warning(
-            "AITE load_market_frame(%s): padding short real series (%d bars) with synthetic "
-            "history to reach %d (last resort)",
-            symbol, len(short_real), bars,
+            "AITE load_market_frame(%s): only %d real bars available (< MIN_BARS=%d); "
+            "returning them unmodified - the exam will reject promotion",
+            symbol, len(short_real), min_accept,
         )
-        return _pad_with_synthetic(short_real, bars, symbol)
+        prov_mod.tag_frame(short_real, source=prov_mod.REAL,
+                           vendor="data.historical", symbol=symbol,
+                           note="short real series, not padded")
+        return short_real.copy()
 
-    logger.warning(
-        "AITE load_market_frame(%s): no usable real OHLC — using full synthetic %d bars",
-        symbol, bars,
+    if allow_synthetic:
+        logger.warning(
+            "AITE load_market_frame(%s): DEMO MODE - no usable real OHLC, using synthetic %d bars",
+            symbol, bars,
+        )
+        return _synthetic_ohlcv(bars, seed=abs(hash(symbol)) % 10_000, symbol=symbol)
+
+    logger.error(
+        "AITE load_market_frame(%s): no real OHLC available - refusing to fabricate bars",
+        symbol,
     )
-    return _synthetic_ohlcv(bars, seed=abs(hash(symbol)) % 10_000)
+    empty = pd.DataFrame(columns=["timestamps", "open", "high", "low", "close", "volume"])
+    return prov_mod.tag_frame(empty, source=prov_mod.UNVERIFIED,
+                              vendor="none", symbol=symbol,
+                              note="no vendor returned usable data")
 
 
-def _synthetic_ohlcv(n: int = 400, seed: int = 7, start_price: float = 22000.0) -> pd.DataFrame:
+def _synthetic_ohlcv(n: int = 400, seed: int = 7, start_price: float = 22000.0,
+                     symbol: str = "") -> pd.DataFrame:
+    """Random-walk OHLCV for tests and demos. Tagged ``synthetic``: never real."""
     rng = np.random.default_rng(seed)
     n = max(1, int(n))
     rets = rng.normal(0.0003, 0.009, size=n)
@@ -487,7 +564,7 @@ def _synthetic_ohlcv(n: int = 400, seed: int = 7, start_price: float = 22000.0) 
     low = np.minimum(open_, close) - spread
     volume = rng.uniform(1e6, 5e6, size=n)
     idx = pd.date_range("2024-01-01", periods=n, freq="B")
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "timestamps": idx,
         "open": open_,
         "high": high,
@@ -495,3 +572,6 @@ def _synthetic_ohlcv(n: int = 400, seed: int = 7, start_price: float = 22000.0) 
         "close": close,
         "volume": volume,
     })
+    return prov_mod.tag_frame(df, source=prov_mod.SYNTHETIC,
+                              vendor="random_walk", symbol=symbol or "SYNTHETIC",
+                              note="generated random walk")

@@ -36,11 +36,36 @@ def aite_tmp(monkeypatch):
     monkeypatch.setattr(cfg, "AGENT_STATE_PATH", root / "agents.json")
     monkeypatch.setattr(cfg, "IDEAS_PATH", root / "ideas.jsonl")
 
-    def _fake_load(symbol, bars=None):
-        n = max(int(bars or 300), int(cfg.MIN_BARS), int(cfg.TARGET_BARS))
-        return _synthetic_ohlcv(n, seed=abs(hash(str(symbol))) % 10_000)
+    from engine import data_provenance as prov_mod
 
-    def _fake_ensure(symbol, bars=None, frames=None):
+    import numpy as np
+    import pandas as pd
+
+    import zlib
+
+    def _fake_load(symbol, bars=None, allow_synthetic=False):
+        """
+        Fixture feed declared as real, so orchestration can be tested offline.
+
+        The provenance gate is covered by tests/test_integrity_fixes.py; these
+        tests are about idea -> survivor -> deploy plumbing.
+        """
+        n = max(int(bars or 300), int(cfg.MIN_BARS), int(cfg.TARGET_BARS))
+        # crc32 keeps the fixture identical across processes (hash() is salted).
+        rng = np.random.default_rng(zlib.crc32(str(symbol).encode()) % 9973)
+        rets = rng.normal(0.0016, 0.006, n)
+        close = 22000.0 * np.cumprod(1.0 + rets)
+        df = pd.DataFrame({
+            "timestamps": pd.bdate_range("2023-01-02", periods=n),
+            "open": close * 0.999,
+            "high": close * 1.004,
+            "low": close * 0.996,
+            "close": close,
+            "volume": 1_000_000.0,
+        })
+        return prov_mod.tag_frame(df, source=prov_mod.REAL, vendor="test_fixture")
+
+    def _fake_ensure(symbol, bars=None, frames=None, allow_synthetic=False):
         df = _fake_load(symbol, bars)
         if frames is not None:
             frames[symbol] = df
@@ -51,6 +76,12 @@ def aite_tmp(monkeypatch):
     # Portfolio / breeding may import load_market_frame by reference later — patch module attrs
     monkeypatch.setattr("engine.aite.portfolio.load_market_frame", _fake_load, raising=False)
     monkeypatch.setattr("engine.aite.breeding.load_market_frame", _fake_load, raising=False)
+
+    # Statistical gates are tested elsewhere; keep them reachable so the
+    # plumbing under test can actually produce a survivor.
+    monkeypatch.setattr(cfg, "MIN_TRADES_OOS", 1)
+    monkeypatch.setattr(cfg, "MIN_OOS_SHARPE", -99.0)
+    monkeypatch.setattr(cfg, "MAX_OOS_DRAWDOWN", 1.0)
     return root
 
 
@@ -102,14 +133,20 @@ def test_pipeline_idea_to_survivor_to_deploy(aite_tmp):
         persist=True,
     )
     assert result["ok"] is True, result.get("error")
-    assert result["n_survivors"] >= cfg.MIN_BOTS
-    assert result["n_survivors"] <= cfg.MAX_BOTS
+    # Survivors are exam-gated: at most one per examined real-data bot, and the
+    # book is explicitly allowed to be short of MIN_BOTS rather than padded.
+    assert 0 <= result["n_survivors"] <= cfg.MAX_BOTS
     assert all(v >= cfg.MIN_BARS for v in (result.get("bar_counts") or {}).values())
 
     port = store.load_portfolio()
-    assert len(port.get("bot_ids") or []) >= cfg.MIN_BOTS
     bots = store.load_bots()
-    assert len(bots) >= cfg.MIN_BOTS
+    saved_ids = {b.get("bot_id") for b in bots}
+    book = [x for x in (port.get("bot_ids") or []) if x]
+    # Every capitalised bot must be a saved, real-data bot; the book may be
+    # short of the survivor count but never padded with unexamined ones.
+    assert set(book) <= saved_ids
+    assert len(port.get("allocations") or {}) == len(book)
+    assert len(book) <= len(bots)
 
     assert len(result.get("deployed") or []) >= 1
     active = active_deployments()
@@ -162,7 +199,8 @@ def test_service_facade_apis(aite_tmp):
         persist=True,
     )
     assert cycle.get("ok") is True, cycle.get("error")
-    assert cycle.get("n_survivors", 0) >= 10
+    # Survivors are exam-gated now; the book is allowed to be short.
+    assert 0 <= cycle.get("n_survivors", 0) <= 12
 
     dep = svc.deploy(venue="paper", note="test")
     assert dep.get("ok") is True

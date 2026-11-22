@@ -268,6 +268,101 @@ def _load(path: str) -> Optional[Dict[str, Any]]:
 #  Public API
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _check_aite_provenance() -> List[Dict[str, Any]]:
+    """Every alive bot must be traceable to real, timestamped bars."""
+    out: List[Dict[str, Any]] = []
+    try:
+        from engine import data_provenance
+        report = data_provenance.audit_stored_state()
+    except Exception as exc:  # noqa: BLE001
+        return [_check("aite:provenance", False, "MEDIUM", f"audit failed: {exc}")]
+
+    bots = report.get("bots") or {}
+    trades = report.get("trades") or {}
+    alive = int(bots.get("alive") or 0)
+    bad_alive = int(bots.get("alive_unverified") or 0) + int(bots.get("alive_synthetic") or 0)
+    if alive == 0:
+        out.append(_check("aite:provenance", True, "INFO", "no live AITE bots"))
+    else:
+        out.append(_check(
+            "aite:provenance", bad_alive == 0, "HIGH",
+            f"{bad_alive}/{alive} alive bots lack a real-data provenance record",
+        ))
+
+    pct = float(trades.get("placeholder_pct") or 0.0)
+    out.append(_check(
+        "aite:timestamps", pct < 1.0, "HIGH" if pct > 50 else "MEDIUM",
+        f"{pct}% of sampled trades carry placeholder timestamps (bar_N) - "
+        "those returns cannot be calendar-aligned or correlated",
+    ))
+
+    cache = report.get("exam_cache") or {}
+    passed = int(cache.get("n_passed") or 0)
+    alive_ids = int((report.get("portfolio") or {}).get("bot_ids") or 0)
+    out.append(_check(
+        "aite:admission", alive_ids <= max(1, passed) if alive_ids else True, "HIGH",
+        f"portfolio holds {alive_ids} bots but only {passed} exam pass was recorded",
+    ))
+    return out
+
+
+def _check_api_auth() -> List[Dict[str, Any]]:
+    """The API must not ship a known key or an unauthenticated route set."""
+    out: List[Dict[str, Any]] = []
+    auth_src = _read_text(os.path.join("backend", "auth.py")) or ""
+    main_src = _read_text(os.path.join("backend", "main.py")) or ""
+
+    # A weak-key *list* is fine (it is how weak keys are detected); what must
+    # never appear is an assignment of a constant to SECRET_KEY.
+    hardcoded = 'SECRET_KEY = "' in auth_src and "_load_secret_key" not in auth_src
+    out.append(_check(
+        "api:secret_key", not hardcoded, "HIGH",
+        "JWT key is loaded from the environment (ZERO_SECRET_KEY), not hard-coded",
+    ))
+    # A wildcard is acceptable only as the documented fallback of a *configured*
+    # allow-list, and never together with credentials.
+    cors_configured = "_cors_open" in main_src and "ZERO_CORS_ORIGINS" in main_src
+    no_credentialed_wildcard = "allow_credentials=not _cors_open" in main_src
+    out.append(_check(
+        "api:cors", cors_configured and no_credentialed_wildcard, "HIGH",
+        "CORS origins come from configuration; credentials are off while the wildcard is on",
+    ))
+    guared = main_src.count("CurrentUser") + main_src.count("TraderUser")
+    out.append(_check(
+        "api:routes_guarded", guared >= 10, "HIGH",
+        f"{guared} guarded route signatures found (bearer token + role dependencies)",
+    ))
+    out.append(_check(
+        "api:typed_tokens", "expected_type" in auth_src, "HIGH",
+        "access and refresh tokens are typed and cannot be swapped",
+    ))
+    return out
+
+
+def _check_data_integrity() -> List[Dict[str, Any]]:
+    """Point-in-time store and broker cross-check availability."""
+    out: List[Dict[str, Any]] = []
+    try:
+        from data import pit_store
+        report = pit_store.verify()
+        out.append(_check(
+            "data:pit_store", report.get("clean", True), "MEDIUM",
+            f"{report.get('symbols', 0)} symbols stored; {len(report.get('issues') or [])} issue(s)",
+        ))
+    except Exception as exc:  # noqa: BLE001
+        out.append(_check("data:pit_store", False, "LOW", f"unavailable: {exc}"))
+    try:
+        from engine.broker import historical
+        available = historical.available_adapters()
+        out.append(_check(
+            "data:broker_history", bool(available), "INFO",
+            f"broker adapters ready: {', '.join(available) or 'none (set Kite/Upstox/Dhan tokens)'}",
+        ))
+    except Exception as exc:  # noqa: BLE001
+        out.append(_check("data:broker_history", False, "LOW", f"unavailable: {exc}"))
+    return out
+
+
 def audit() -> Dict[str, Any]:
     """Run every check. Returns a structured, JSON-safe report."""
     checks: List[Dict[str, Any]] = []
@@ -279,6 +374,9 @@ def audit() -> Dict[str, Any]:
     checks += _check_dead_code()
     checks += _check_syntax()
     checks += _check_duplicate_frontend()
+    checks += _check_aite_provenance()
+    checks += _check_api_auth()
+    checks += _check_data_integrity()
 
     failed = [c for c in checks if not c["ok"]]
     high = [c for c in failed if c["severity"] == "HIGH"]

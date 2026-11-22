@@ -54,7 +54,7 @@ CACHE_DIR = os.path.join("db", "v2", "cache")
 
 DEFAULT_CAPITAL = 1_000_000.0
 DEFAULT_RISK_PCT = 0.75          # % of capital risked per trade
-DEFAULT_COST_BPS = 12.0          # per leg: brokerage + STT + slippage proxy
+DEFAULT_COST_BPS = 12.0          # fallback only: see engine/v2/costs.py
 MIN_TRADES_TO_PASS = 20
 MIN_PROFIT_FACTOR = 1.15
 MAX_DRAWDOWN_PCT = 12.0
@@ -261,6 +261,23 @@ def _signals(df, spec: StrategySpec) -> Dict[str, Any]:
 #  Backtest
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _round_trip_cost(entry_price: float, exit_price: float, qty: float,
+                     side: int, bars_held: int, cost_bps: float) -> float:
+    """
+    Real Indian cost stack for both legs, in rupees.
+
+    Falls back to the flat ``cost_bps`` proxy only when the cost model is
+    disabled (``ZERO_LAB_COST_MODEL=bps``) or unavailable.
+    """
+    try:
+        from engine.v2 import costs as cost_mod
+        rt = cost_mod.round_trip_cost(entry_price, exit_price, qty, side,
+                                      bars_held=bars_held)
+        return float(rt["total"])
+    except Exception:
+        return (entry_price + exit_price) * qty * cost_bps / 10_000.0
+
+
 def _warmup(spec: StrategySpec) -> int:
     return max(
         int(spec.params.get("regime", 0) or 0),
@@ -361,7 +378,7 @@ def backtest(
                 "initial_stop": entry_price - side * risk,
                 "qty": qty,
                 "entry_i": i + 1,
-                "cost": entry_price * qty * cost_bps / 10_000.0,
+                "cost": 0.0,  # both legs are charged at exit (see _round_trip_cost)
                 "mae": 0.0,
                 "mfe": 0.0,
                 "best": entry_price,
@@ -406,8 +423,8 @@ def backtest(
             continue
 
         gross = (exit_price - pos["entry"]) * pos["qty"] * side
-        exit_cost = exit_price * pos["qty"] * cost_bps / 10_000.0
-        net = gross - pos["cost"] - exit_cost
+        net = gross - _round_trip_cost(pos["entry"], exit_price, pos["qty"], side,
+                                       j - pos["entry_i"], cost_bps)
         eq += net
         peak = max(peak, eq)
         max_dd = max(max_dd, (peak - eq) / peak * 100.0 if peak else 0.0)
@@ -419,7 +436,8 @@ def backtest(
     if pos is not None:
         side = int(pos["side"])
         exit_price = float(close.iloc[end - 1])
-        net = (exit_price - pos["entry"]) * pos["qty"] * side - pos["cost"]
+        net = (exit_price - pos["entry"]) * pos["qty"] * side - _round_trip_cost(
+            pos["entry"], exit_price, pos["qty"], side, end - 1 - pos["entry_i"], cost_bps)
         eq += net
         trades.append(_trade_row(
             pos, side, exit_price, dates[end - 1], "MARK_TO_MARKET",
@@ -915,6 +933,8 @@ def run_lab(
     _ensure_dir()
     entries: List[Dict[str, Any]] = []
     skipped: List[Dict[str, str]] = []
+    trial_returns: Dict[str, List[float]] = {}
+    runs: Dict[str, Dict[str, Any]] = {}
 
     for index_key in indices:
         df = _frame(index_key, refresh=refresh_data)
@@ -930,10 +950,24 @@ def run_lab(
                 except Exception as exc:
                     skipped.append({"index": index_key, "family": family, "reason": str(exc)[:120]})
                     continue
-                entries.append(_persist_run(spec, result, validation))
+                entry = _persist_run(spec, result, validation)
+                entries.append(entry)
+                # PBO/DSR need a *period* series, not one number per trade: 17
+                # trades is too short for CSCV, while the same trades spread
+                # over daily bars give the few hundred periods it needs.
+                try:
+                    from engine.v2.portfolio_risk import daily_returns
+                    daily = daily_returns(result.get("trades") or [], DEFAULT_CAPITAL)
+                except Exception:
+                    daily = {}
+                if len(daily) >= 20:
+                    trial_returns[entry["name"]] = list(daily.values())
+                if entry.get("validated"):
+                    runs[entry["name"]] = result
 
     _prune_orphans({e["name"] for e in entries})
     registry = _save_registry(entries)
+    diagnostics = _lab_diagnostics(trial_returns, runs)
     return {
         "schema": SCHEMA_VERSION,
         "registry": registry,
@@ -942,7 +976,40 @@ def run_lab(
         "passed": registry["passed"],
         "validated": registry["validated"],
         "top": registry["top"],
+        "diagnostics": diagnostics,
     }
+
+
+def _lab_diagnostics(trial_returns: Dict[str, List[float]],
+                     runs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Selection-bias and book-risk diagnostics for one lab run.
+
+    Both are *reported*, not silently enforced as extra hidden gates: PBO/DSR
+    answer "was picking the winner meaningful?" and the book risk answers "what
+    does the combined equity curve look like?".
+    """
+    out: Dict[str, Any] = {}
+    if len(trial_returns) >= 2:
+        try:
+            from engine.v2 import overfitting
+            out["overfitting"] = overfitting.summarise(trial_returns)
+        except Exception as exc:  # noqa: BLE001
+            out["overfitting"] = {"error": str(exc)[:160]}
+    if runs:
+        try:
+            from engine.v2 import portfolio_risk
+            risk = portfolio_risk.book_risk(runs)
+            out["book_risk"] = {"risk": risk, "gate": portfolio_risk.gate(risk)}
+        except Exception as exc:  # noqa: BLE001
+            out["book_risk"] = {"error": str(exc)[:160]}
+    try:
+        os.makedirs(os.path.join("db", "v2"), exist_ok=True)
+        with open(os.path.join("db", "v2", "lab_diagnostics.json"), "w", encoding="utf-8") as fh:
+            json.dump(out, fh, indent=2, default=str)
+    except Exception:
+        pass
+    return out
 
 
 def open_folder() -> Dict[str, Any]:

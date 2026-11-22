@@ -35,6 +35,7 @@
 - [CLI Operations](#-cli-operations)
 - [Obsidian Second Brain Integration](#-obsidian-second-brain-integration)
 - [Security & Privacy](#-security--privacy)
+- [Integrity Pass — Auth, Provenance, Correlation](#-integrity-pass--auth-provenance-correlation-2026-11-22)
 - [Disclaimer](#-disclaimer)
 
 ---
@@ -716,6 +717,86 @@ On a fresh machine: Python 3.11+, `pip install -r requirements.txt`, copy
 `.env.example` to `.env`, then `python -m engine.v2 lab` before the first launch.
 REA's MCP bridge needs Node `^22.23.4 || ^24.22.1 || >=26.12.1`; `ZERO_NODE_DIR`
 points the engine at a side-by-side runtime when the system Node is older.
+
+---
+
+## 🔐 Integrity Pass — Auth, Provenance, Correlation (2026-11-22)
+
+Three defects could turn nothing into an apparent edge. They are fixed, and the
+regressions that would let them return are covered by
+[`tests/test_integrity_fixes.py`](tests/test_integrity_fixes.py).
+
+### 1. The backend API is authenticated
+
+Every `/api/v1` route except `/health`, `/status` and `/auth/login` now requires
+`Authorization: Bearer <access token>`. `/auth/me` returns the token's real
+subject (it used to return a hard-coded admin), `/auth/refresh` accepts only a
+signed **refresh** token (it used to mint an access token from any string), and
+`/auth/logout` revokes the `jti`. Trading mutations require the `trader` or
+`admin` role, and orders/strategies are scoped to their owner. The signing key
+comes from `ZERO_SECRET_KEY`; CORS is configured via `ZERO_CORS_ORIGINS` and
+credentials are disabled while the wildcard fallback is active.
+
+```bash
+# required outside development (>=32 chars)
+setx ZERO_SECRET_KEY "<random 48+ chars>"
+```
+
+### 2. Synthetic bars can no longer pass an exam
+
+`load_market_frame` used to pad a short real series with a synthetic random walk
+and fall back to a fully synthetic frame, while only writing a log line. Every
+frame now carries a tag (`real` / `synthetic` / `mixed` / `unverified`) via
+[`engine/data_provenance.py`](engine/data_provenance.py). Promotion requires
+real, timestamped, OHLC-clean bars with ≥252 rows; synthetic data can only be
+produced with `allow_synthetic=True` (tests/demos) and **never** passes the
+gate. The provenance record is stored on the exam result and on the bot, so a
+stored survivor can always be traced to the bars that produced it.
+
+### 3. Correlation is calendar-aligned
+
+Portfolio diversification compared one bot's trade #3 with another bot's trade
+#3 — unrelated dates, so two bots trading different weeks always looked
+"diversified". Returns are now booked on each trade's exit date, aggregated per
+calendar day, and correlated only over shared dates (≥20 days, else the pair is
+treated as redundant rather than independent). Admission also requires a passing
+exam; the book is no longer padded to `MIN_BOTS` with bots that never cleared
+the gate.
+
+### What was added in the same pass
+
+| Capability | Command | Module |
+|---|---|---|
+| AITE book provenance audit | `python -m engine.v2 provenance` | `engine/data_provenance.py` |
+| Portfolio-level risk (book DD, vol, HHI, risk contribution) | `python -m engine.v2 risk` | `engine/v2/portfolio_risk.py` |
+| PBO (CSCV) + Deflated Sharpe | `python -m engine.v2 overfit` | `engine/v2/overfitting.py` |
+| Real Indian cost stack in the lab | `python -m engine.v2 costs` | `engine/v2/costs.py` |
+| Paper-forward shadow + reconciliation | `python -m engine.v2 shadow --record --score` | `engine/v2/shadow.py` |
+| Alerts (webhook / Telegram / SMTP) | `from engine.v2 import alerts` | `engine/v2/alerts.py` |
+| Point-in-time Parquet store (`as_of`) | `python -m data.pit_store` | `data/pit_store.py` |
+| Broker history (Kite / Upstox / Dhan) | `python -m engine.broker.historical` | `engine/broker/historical.py` |
+| Order state machine + reconciliation | `python -m engine.broker.order_state` | `engine/broker/order_state.py` |
+| Options chain snapshots (PCR, OI walls, skew) | `python -m data.options_snapshot` | `data/options_snapshot.py` |
+| CI: tests + integrity audit | — | `.github/workflows/integrity.yml` |
+
+### The cost model changed, and it matters
+
+A ₹18-lakh intraday round trip now costs **≈₹1,767** in statutorily itemised
+charges (STT, exchange, SEBI, stamp, GST, ₹20 brokerage, 3 bps adverse
+slippage). The flat proxy the lab used to charge was **₹4,320** — a 2.4×
+overstatement for index-sized trades, and an understatement for small ones.
+`python -m engine.v2 costs` prints the full breakdown and breakeven points.
+
+### State of the existing AITE book
+
+`python -m engine.v2 provenance` reports the checked-in book as
+**`contaminated_or_unprovable`**: 20/20 alive bots have no provenance record,
+100% of 20,000 sampled trades carry placeholder `bar_<n>` timestamps (no usable
+calendar, so no honest correlation), and 20 bots sit in the portfolio against 1
+recorded exam pass. Attribution is impossible after the fact — the book must be
+re-derived on real bars. Until then, treat every existing survivor as
+unvalidated. Details and the re-run sequence are in
+[`MANUAL_REQUIRED_IMPLEMENTATIONS.md`](MANUAL_REQUIRED_IMPLEMENTATIONS.md) §2.6.
 
 ---
 

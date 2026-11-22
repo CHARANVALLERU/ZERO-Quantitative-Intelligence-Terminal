@@ -49,6 +49,9 @@ class BotGenome:
     status: str = "candidate"  # candidate|exam|alive|fading|dead
     created_at: float = field(default_factory=time.time)
     style: str = "mixed"  # momentum|mean_reversion|breakout|flow|mixed
+    # Provenance of the bars that last gated this bot (engine.data_provenance).
+    # Empty means "never examined" - never treat that as real data.
+    data_provenance: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -72,6 +75,7 @@ class BotGenome:
             status=str(d.get("status", "candidate")),
             created_at=float(d.get("created_at") or time.time()),
             style=str(d.get("style", "mixed")),
+            data_provenance=dict(d.get("data_provenance") or {}),
         )
 
 
@@ -118,6 +122,9 @@ class ExamResult:
     fitness: float = 0.0
     reason: str = ""
     progress_lines: List[str] = field(default_factory=list)
+    # real | synthetic | mixed | unverified (engine.data_provenance)
+    data_source: str = ""
+    data_provenance: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -132,6 +139,10 @@ class PortfolioState:
     corr_matrix: Dict[str, Dict[str, float]] = field(default_factory=dict)
     killed: List[str] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
+    # How the correlation matrix was estimated, so it is never mistaken for a
+    # per-trade P&L correlation again.
+    correlation_method: str = "calendar_aligned_daily"
+    correlation_overlap_ok: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

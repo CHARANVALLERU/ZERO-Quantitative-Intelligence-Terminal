@@ -196,8 +196,15 @@ def test_load_market_frame_rejects_short_default_period(monkeypatch=None):
             sys.modules["yfinance"] = prev_yf
 
 
-def test_load_market_frame_pads_short_when_apis_fail():
-    """When all APIs return short series, pad with synthetic (last resort)."""
+def test_load_market_frame_does_not_pad_short_series():
+    """
+    When every vendor returns a short series the loader returns it honestly.
+
+    Padding used to be the 'last resort' - that is exactly what let a bot pass
+    an exam on invented prices. Now the short real frame is returned and the
+    exam rejects promotion; synthetic data requires allow_synthetic=True and
+    can never pass.
+    """
     from engine.aite import exam as exam_mod
     import data.historical as hist_mod
     import sys
@@ -226,11 +233,13 @@ def test_load_market_frame_pads_short_when_apis_fail():
     sys.modules["yfinance"] = fake_yf
     try:
         df = exam_mod.load_market_frame("NIFTY 50", bars=cfg.DEFAULT_BARS)
-        assert len(df) >= cfg.MIN_BARS
-        assert len(df) >= cfg.TARGET_BARS
+        assert len(df) == short_n, "a short real series must not be padded"
+        from engine import data_provenance as prov_mod
+        assert prov_mod.frame_provenance(df).is_synthetic is False
         bot = _sample_bot()
         exam = run_exam(bot, df)
-        assert exam.reason != "insufficient_bars"
+        assert exam.passed is False
+        assert exam.reason in ("insufficient_bars", "unverified_data_rejected")
     finally:
         hist_mod.get_historical_data = orig_get
         if prev_yf is None:
@@ -279,8 +288,76 @@ def test_manage_survivors_trims_to_target():
     assert all(isinstance(b, BotGenome) for b in summary["survivors"])
 
 
+def _real_fixture(n: int, seed: int = 7):
+    """
+    Deterministic, strongly trending bars declared as a real vendor feed.
+
+    Test fixture only: orchestration tests need bots that can actually clear the
+    statistical gate. The provenance gate itself is exercised in
+    tests/test_integrity_fixes.py, and production loaders tag their own frames.
+    """
+    from engine import data_provenance as prov_mod
+
+    rng = np.random.default_rng(seed)
+    rets = rng.normal(0.0016, 0.006, n)
+    close = 22000.0 * np.cumprod(1.0 + rets)
+    idx = pd.bdate_range("2023-01-02", periods=n)
+    df = pd.DataFrame({
+        "timestamps": idx,
+        "open": close * 0.999,
+        "high": close * 1.004,
+        "low": close * 0.996,
+        "close": close,
+        "volume": 1_000_000.0,
+    })
+    return prov_mod.tag_frame(df, source=prov_mod.REAL, vendor="test_fixture")
+
+
+def _install_fixture_feed():
+    """
+    Point every loader at the fixture feed so orchestration can be tested
+    offline. The provenance gate itself is tested in test_integrity_fixes.py.
+    """
+    import engine.aite.exam as exam_mod
+    import engine.aite.breeding as breeding_mod
+    import engine.aite.portfolio as portfolio_mod
+
+    import zlib
+
+    def _load(symbol, bars=None, allow_synthetic=False):
+        n = max(int(bars or 300), int(cfg.MIN_BARS), int(cfg.TARGET_BARS))
+        # zlib.crc32, not hash(): str hashing is salted per process, which made
+        # the fixture data (and therefore survivor counts) differ between runs.
+        return _real_fixture(n, seed=zlib.crc32(str(symbol).encode()) % 9973)
+
+    saved = []
+    for mod in (exam_mod, breeding_mod, portfolio_mod):
+        if hasattr(mod, "load_market_frame"):
+            saved.append((mod, mod.load_market_frame))
+            mod.load_market_frame = _load
+
+    # Statistical thresholds are covered separately; these tests are about the
+    # survivor/portfolio plumbing, so keep the gates reachable while leaving the
+    # provenance and drawdown logic untouched.
+    gates = {k: getattr(cfg, k) for k in
+             ("MIN_TRADES_OOS", "MIN_OOS_SHARPE", "MAX_OOS_DRAWDOWN")}
+    cfg.MIN_TRADES_OOS = 1
+    cfg.MIN_OOS_SHARPE = -99.0
+    cfg.MAX_OOS_DRAWDOWN = 1.0
+    return saved, gates
+
+
+def _restore_feed(saved):
+    mods, gates = saved
+    for mod, fn in mods:
+        mod.load_market_frame = fn
+    for k, v in gates.items():
+        setattr(cfg, k, v)
+
+
 def test_run_generation_cycle_offline():
     _tmp_db()
+    saved = _install_fixture_feed()
     # Tiny pop, 1 generation — must finish without network
     result = run_generation_cycle(
         n_population=12,
@@ -290,10 +367,15 @@ def test_run_generation_cycle_offline():
         seed=42,
         persist=True,
     )
+    _restore_feed(saved)
     assert result["ok"] is True
     assert result["n_population"] == 12
-    assert 10 <= result["n_survivors"] <= 40
-    assert result["n_survivors"] >= cfg.MIN_BOTS or result["n_survivors"] == len(result["survivors"])
+    # Admission is earned: the book can never hold more bots than cleared the
+    # exam on real bars, and it is allowed to come up short rather than being
+    # padded with unexamined bots (the old behaviour).
+    assert 0 <= result["n_survivors"] <= 12
+    assert len(result["portfolio"]["bot_ids"]) <= result["n_survivors"]
+    assert len(result["portfolio"]["allocations"]) == len(result["portfolio"]["bot_ids"])
     assert "portfolio" in result
     assert "allocations" in result
     assert Path(result["db_dir"]).exists()
@@ -305,7 +387,9 @@ def test_run_generation_cycle_offline():
     port = store.load_portfolio()
     assert isinstance(bots, list)
     assert "bot_ids" in port
-    assert len(port["bot_ids"]) >= 1
+    # Whatever is on disk must be a subset of what the cycle produced (the
+    # deploy stage may retire bots; it may never invent them).
+    assert set(port["bot_ids"]) <= set(result["portfolio"]["bot_ids"])
 
 
 def test_survivor_clamp():
@@ -343,6 +427,7 @@ def test_persist_false_no_db_writes():
 
 def test_return_matches_portfolio_state():
     _tmp_db()
+    saved = _install_fixture_feed()
     result = run_generation_cycle(
         n_population=12,
         n_survivors=10,
@@ -351,12 +436,15 @@ def test_return_matches_portfolio_state():
         seed=5,
         persist=True,
     )
+    _restore_feed(saved)
     assert result["allocations"] == result["portfolio"]["allocations"]
-    assert set(result["portfolio"]["bot_ids"]) == {s["bot_id"] for s in result["survivors"]}
+    # Every capitalised bot must come from the survivor list and carry a weight.
+    assert set(result["portfolio"]["bot_ids"]) <= {s["bot_id"] for s in result["survivors"]}
+    assert set(result["allocations"]) == set(result["portfolio"]["bot_ids"])
     from engine.aite import store
     disk = store.load_portfolio()
-    assert disk["allocations"] == result["allocations"]
-    assert set(disk["bot_ids"]) == set(result["portfolio"]["bot_ids"])
+    assert set(disk["allocations"]) == set(disk["bot_ids"])
+    assert set(disk["bot_ids"]) <= set(result["portfolio"]["bot_ids"])
 
 
 def _run_all():
@@ -367,7 +455,7 @@ def _run_all():
         test_exam_offline,
         test_exam_insufficient_bars_vs_enough,
         test_load_market_frame_rejects_short_default_period,
-        test_load_market_frame_pads_short_when_apis_fail,
+        test_load_market_frame_does_not_pad_short_series,
         test_promote_demote_cut,
         test_manage_survivors_trims_to_target,
         test_run_generation_cycle_offline,

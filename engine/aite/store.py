@@ -149,8 +149,21 @@ def load_portfolio() -> Dict[str, Any]:
     })
 
 
-def save_portfolio(state: Dict[str, Any]) -> bool:
+def save_portfolio(state: Dict[str, Any], allow_empty: bool = False) -> bool:
+    """
+    Persist the book, refusing to erase a populated book by accident.
+
+    Several stages (portfolio build, rebalance, deploy, edge monitor) write this
+    file, and a stage that legitimately selected nothing used to wipe the book a
+    later stage was about to read ("no bot ids from portfolio"). An empty write
+    over a non-empty book now requires ``allow_empty=True``.
+    """
     state["updated_at"] = time.time()
+    if not allow_empty and not (state.get("bot_ids") or []):
+        existing = read_json(cfg.PORTFOLIO_PATH, {}) or {}
+        if existing.get("bot_ids"):
+            log_event("WARN", "Refused to overwrite a populated portfolio with an empty one")
+            return False
     return write_json(cfg.PORTFOLIO_PATH, state)
 
 

@@ -11,6 +11,11 @@ Usage (from the project root):
     python -m engine.v2 audit --repair   # integrity audit (and safe repairs)
     python -m engine.v2 rea-probe        # discover REA MCP tools
     python -m engine.v2 brief            # print today's session brief
+    python -m engine.v2 provenance       # is the AITE book built on real bars?
+    python -m engine.v2 risk             # portfolio-level risk of the validated book
+    python -m engine.v2 overfit          # PBO / deflated Sharpe for the lab
+    python -m engine.v2 shadow --record --score
+    python -m engine.v2 costs            # real Indian cost stack vs the flat proxy
 """
 
 from __future__ import annotations
@@ -110,6 +115,71 @@ def cmd_brief() -> int:
     return 0
 
 
+def cmd_provenance() -> int:
+    from engine import data_provenance
+    report = data_provenance.audit_stored_state()
+    _print(report)
+    return 0 if report.get("verdict") == "clean" else 1
+
+
+def cmd_risk() -> int:
+    from engine.v2 import portfolio_risk
+    payload = portfolio_risk.from_registry()
+    _print(payload)
+    return 0 if (payload.get("gate") or {}).get("passed") else 1
+
+
+def cmd_overfit() -> int:
+    from engine.v2 import overfitting, strategy_lab
+
+    entries = (strategy_lab.load_registry().get("strategies") or [])[:20]
+    trials = {}
+    frames = {}
+    for entry in entries:
+        try:
+            spec = strategy_lab.StrategySpec(
+                family=str(entry.get("family") or "BREAKOUT"),
+                index_key=str(entry.get("index") or "NIFTY"),
+                params=dict(entry.get("params") or {}),
+                name=str(entry.get("name") or ""),
+            )
+        except Exception:
+            continue
+        key = spec.index_key
+        if key not in frames:
+            frames[key] = strategy_lab._frame(key)
+        if frames[key] is None or not len(frames[key]):
+            continue
+        result = strategy_lab.backtest(frames[key], spec)
+        from engine.v2.portfolio_risk import daily_returns
+        daily = daily_returns(result.get("trades") or [], strategy_lab.DEFAULT_CAPITAL)
+        if len(daily) >= 20:
+            trials[spec.name] = list(daily.values())
+    if len(trials) < 2:
+        _print({"status": "INSUFFICIENT_TRIALS", "trials": len(trials)})
+        return 1
+    _print(overfitting.summarise(trials))
+    return 0
+
+
+def cmd_shadow(record: bool, score: bool, index: str) -> int:
+    from engine.v2 import shadow
+    out = {}
+    if record:
+        out["record"] = shadow.record_day(index)
+    if score:
+        out["score"] = shadow.score_day(index)
+    out["reconciliation"] = shadow.reconciliation()
+    _print(out)
+    return 0
+
+
+def cmd_costs() -> int:
+    from engine.v2 import costs
+    _print(costs.cost_model_report())
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m engine.v2", description="ZERO Engine v2.0")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -129,6 +199,16 @@ def main(argv=None) -> int:
     p_audit = sub.add_parser("audit", help="run the integrity audit")
     p_audit.add_argument("--repair", action="store_true", help="apply safe repairs")
 
+    sub.add_parser("provenance", help="audit AITE survivor/portfolio data provenance")
+    sub.add_parser("risk", help="portfolio-level risk of the validated book")
+    sub.add_parser("overfit", help="PBO and deflated Sharpe for the lab run")
+    sub.add_parser("costs", help="real Indian cost stack vs the flat bps proxy")
+
+    p_shadow = sub.add_parser("shadow", help="paper-forward signals and reconciliation")
+    p_shadow.add_argument("--record", action="store_true", help="append today's signals")
+    p_shadow.add_argument("--score", action="store_true", help="score elapsed signals")
+    p_shadow.add_argument("--index", default="NIFTY")
+
     args = parser.parse_args(argv)
     if args.command == "status":
         return cmd_status()
@@ -144,6 +224,16 @@ def main(argv=None) -> int:
         return cmd_rea_probe()
     if args.command == "brief":
         return cmd_brief()
+    if args.command == "provenance":
+        return cmd_provenance()
+    if args.command == "risk":
+        return cmd_risk()
+    if args.command == "overfit":
+        return cmd_overfit()
+    if args.command == "costs":
+        return cmd_costs()
+    if args.command == "shadow":
+        return cmd_shadow(args.record, args.score, args.index)
     return 2
 
 

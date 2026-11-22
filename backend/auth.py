@@ -1,63 +1,105 @@
 """
 ZERO Terminal Backend API - Authentication Module
-===================================================
+=================================================
 
-Provides authentication and session management for the ZERO Terminal.
-Uses JWT-based authentication with FastAPI.
+Authentication *library* for the ZERO Terminal: password hashing, JWT issue
+and verification, revocation, role checks and API-key checks.
+
+This module deliberately contains **no FastAPI routes**. It used to decorate
+handlers with ``@app.post(...)`` while never importing ``app``, so the module
+raised ``NameError`` on import and ``backend.main``'s login handler blew up the
+first time anyone tried to sign in. Routes live in ``backend.main``.
+
+Security rules enforced here (2026-11-22):
+
+* the signing key comes from ``ZERO_SECRET_KEY``; the old hard-coded
+  ``"your-secret-key-here"`` is gone. If no key is configured in a non-dev
+  environment the module refuses to sign tokens rather than silently using a
+  public constant;
+* an *access* token can never be minted from a *refresh* token (the old
+  ``/auth/refresh`` endpoint signed whatever string it was given);
+* every token carries a ``jti`` that can be revoked on logout;
+* API keys come from the environment, not a source-code dictionary.
 """
+from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-import uuid
-import logging
 import hashlib
+import logging
+import os
+import secrets
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Set
 
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr
-from fastapi import Depends, HTTPException, status, APIKeyHeader
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 
-logger = logging.getLogger('ZERO_Auth')
+logger = logging.getLogger("ZERO_Auth")
 
-# Configuration
-SECRET_KEY = "your-secret-key-here"  # Change in production!
+# ── Configuration ───────────────────────────────────────────────────────────
+
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
-REFRESH_TOKEN_EXPIRE_DAYS = 7
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ZERO_ACCESS_TOKEN_MINUTES", str(60 * 8)))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("ZERO_REFRESH_TOKEN_DAYS", "7"))
 
-# Password hashing context
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto",
-    bcrypt__rounds=12,
-)
-
-# Token storage (in-memory for now, use Redis in production)
-token_store: Dict[str, Dict[str, Any]] = {}
-
-# API Key validation
-valid_api_keys = {
-    "terminal-read": {"description": "Read-only terminal access"},
-    "terminal-write": {"description": "Full terminal access"},
-    "admin": {"description": "Administrative access"},
+_DEV_ENV_VALUES = {"dev", "development", "local", "test", "testing"}
+_INSECURE_KEYS = {
+    "", "your-secret-key-here", "change-in-production", "changeme", "secret",
+    "test", "development",
 }
 
+_ENV = (os.getenv("ZERO_ENV") or os.getenv("ENVIRONMENT") or "development").strip().lower()
+IS_DEV = _ENV in _DEV_ENV_VALUES
 
-# Pydantic models
+
+def _load_secret_key() -> str:
+    key = (os.getenv("ZERO_SECRET_KEY") or os.getenv("SECRET_KEY") or "").strip()
+    if key.lower() in _INSECURE_KEYS or len(key) < 32:
+        if IS_DEV:
+            # Ephemeral per-process key: tokens stop working on restart, which
+            # is the correct behaviour for an unset key in development.
+            key = secrets.token_urlsafe(48)
+            logger.warning(
+                "ZERO_SECRET_KEY unset or too short - using an ephemeral development key. "
+                "Tokens will not survive a restart. Set ZERO_SECRET_KEY (>=32 chars)."
+            )
+        else:
+            raise RuntimeError(
+                "ZERO_SECRET_KEY must be set to a strong value (>=32 chars) when "
+                f"ZERO_ENV={_ENV!r}. Refusing to sign tokens with a default key."
+            )
+    return key
+
+
+SECRET_KEY = _load_secret_key()
+
+# Revoked token ids (jti) with their expiry, so the set can be pruned.
+_revoked: Dict[str, float] = {}
+# Refresh-token reuse tracking: username -> jti of the refresh token in force.
+_refresh_in_force: Dict[str, str] = {}
+
+_DEV_ADMIN = (os.getenv("ZERO_DEV_ADMIN_USERNAME") or "").strip()
+
+
+# ── Models ──────────────────────────────────────────────────────────────────
+
 class User(BaseModel):
-    """User model."""
+    """Authenticated principal."""
+
     id: str
     email: str
     username: str
-    is_active: bool
-    is_verified: bool
-    role: str  # 'viewer', 'trader', 'admin'
-    created_at: datetime
+    is_active: bool = True
+    is_verified: bool = True
+    role: str = "viewer"          # viewer | trader | admin
+    created_at: datetime = datetime.now(timezone.utc)
 
 
 class UserCreate(BaseModel):
-    """User creation model."""
     email: str
     username: str
     password: str
@@ -65,250 +107,321 @@ class UserCreate(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    """Token response model."""
     access_token: str
     refresh_token: str
-    token_type: str
+    token_type: str = "bearer"
     expires_in: int
     user: Dict[str, Any]
 
 
 class TokenData(BaseModel):
-    """Token data model."""
     username: Optional[str] = None
     scope: Optional[str] = None
+    role: Optional[str] = None
+    jti: Optional[str] = None
 
 
-# Helper functions
+# ── Passwords ───────────────────────────────────────────────────────────────
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+
+
 def hash_password(password: str) -> str:
-    """Hash a password."""
     return pwd_context.hash(password)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception:
+        return False
 
 
-def create_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None, scope: str = "access") -> str:
-    """Create a JWT token."""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now() + expires_delta
-    else:
-        expire = datetime.now() + timedelta(minutes=15)
-    
+# ── Tokens ──────────────────────────────────────────────────────────────────
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def create_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None,
+    scope: str = "access",
+    token_type: str = "access",
+) -> str:
+    """Issue a signed JWT. ``token_type`` must match what the caller will do."""
+    to_encode = dict(data)
+    expire = _now() + (expires_delta or timedelta(minutes=15))
+    jti = uuid.uuid4().hex
     to_encode.update({
         "exp": expire,
-        "iat": datetime.now(),
+        "iat": _now(),
+        "nbf": _now(),
         "scope": scope,
-        "type": "access",
+        "type": token_type,
+        "jti": jti,
+        "iss": "zero-terminal",
     })
-    
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def create_refresh_token(username: str) -> str:
-    """Create a refresh token."""
-    data = {"sub": username, "type": "refresh", "scope": "refresh"}
-    return create_token(data, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), scope="refresh")
-
-
-def get_user_from_token(token: str) -> Optional[User]:
-    """Get user from JWT token."""
+def create_refresh_token(username: str, role: str = "viewer") -> str:
+    token = create_token(
+        {"sub": username, "role": role},
+        timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+        scope="refresh",
+        token_type="refresh",
+    )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            return None
-        return User(
-            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, username)),
-            email=username,
-            username=username,
-            is_active=True,
-            is_verified=True,
-            role="trader",
-            created_at=datetime.now(),
-        )
+        _refresh_in_force[username] = jwt.get_unverified_claims(token).get("jti", "")
     except JWTError:
+        pass
+    return token
+
+
+def _prune_revoked() -> None:
+    now = time.time()
+    for jti, exp in list(_revoked.items()):
+        if exp < now:
+            _revoked.pop(jti, None)
+
+
+def revoke_token(token: str) -> bool:
+    """Add a token's jti to the revocation list (logout)."""
+    try:
+        claims = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return False
+    jti = claims.get("jti")
+    if not jti:
+        return False
+    _prune_revoked()
+    _revoked[str(jti)] = float(claims.get("exp") or (time.time() + 3600))
+    if claims.get("type") == "refresh":
+        sub = str(claims.get("sub") or "")
+        if sub and _refresh_in_force.get(sub) == jti:
+            _refresh_in_force.pop(sub, None)
+    return True
+
+
+def decode_token(token: str, expected_type: str = "access") -> Dict[str, Any]:
+    """
+    Decode and validate a token.
+
+    Raises ``HTTPException(401)`` on any problem, including a token whose
+    ``type`` does not match what the caller needs (a refresh token presented as
+    a bearer credential, or vice versa).
+    """
+    cred_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        claims = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM],
+                            options={"verify_aud": False})
+    except JWTError as exc:
+        logger.info("token rejected: %s", exc)
+        raise cred_exc
+
+    if str(claims.get("type") or "access") != expected_type:
+        logger.warning("token type mismatch: got %r wanted %r",
+                       claims.get("type"), expected_type)
+        raise cred_exc
+    jti = claims.get("jti")
+    if jti and str(jti) in _revoked:
+        raise cred_exc
+    if not claims.get("sub"):
+        raise cred_exc
+    return claims
+
+
+def get_user_from_token(token: str, expected_type: str = "access") -> Optional[User]:
+    """Claims -> User, or None. Never raises (kept for backward compatibility)."""
+    try:
+        claims = decode_token(token, expected_type=expected_type)
+    except HTTPException:
         return None
+    sub = str(claims.get("sub"))
+    role = str(claims.get("role") or "viewer")
+    return User(
+        id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"zero:{sub}")),
+        email=sub,
+        username=sub,
+        is_active=True,
+        is_verified=True,
+        role=role,
+        created_at=datetime.now(timezone.utc),
+    )
 
 
-# Dependency functions
+# ── Dependencies ────────────────────────────────────────────────────────────
+
+_bearer = HTTPBearer(auto_error=False)
+
+
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> User:
-    """Get current user from token."""
-    token = credentials.credentials
-    user = get_user_from_token(token)
-    if user is None:
+    """FastAPI dependency: bearer access token -> User, else 401."""
+    if credentials is None or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
+            detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return user
+    claims = decode_token(credentials.credentials, expected_type="access")
+    sub = str(claims.get("sub"))
+    return User(
+        id=str(claims.get("uid") or uuid.uuid5(uuid.NAMESPACE_URL, f"zero:{sub}")),
+        email=str(claims.get("email") or sub),
+        username=sub,
+        is_active=True,
+        is_verified=True,
+        role=str(claims.get("role") or "viewer"),
+        created_at=datetime.now(timezone.utc),
+    )
 
 
 async def get_current_active_user(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ) -> User:
-    """Get current active user."""
     if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="User is not active")
+        raise HTTPException(status_code=403, detail="User is not active")
     return current_user
 
 
-async def verify_scope(required_scope: str):
-    """Dependency to verify user scope."""
-    credentials = HTTPAuthorizationCredentials(
-        scheme="Bearer",
-        credentials=""
-    )
-    token = credentials.credentials
-    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    
-    user_scope = payload.get("scope", "")
-    if required_scope not in user_scope:
+def require_role(*roles: str):
+    """
+    Dependency factory: ``Depends(require_role("trader", "admin"))``.
+
+    ``admin`` always passes. Unknown roles fail closed.
+    """
+    allowed = {r.lower() for r in roles if r}
+
+    async def _dep(user: User = Depends(get_current_user)) -> User:
+        role = (user.role or "").lower()
+        if role == "admin" or role in allowed:
+            return user
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Operation requires '{required_scope}' scope"
+            detail=f"Requires role: {', '.join(sorted(allowed)) or 'admin'}",
         )
 
-
-# Authentication routes
-@app.post("/api/auth/login", response_model=TokenResponse)
-async def login(form_data: "OAuth2PasswordRequestForm" = Depends()):
-    """Login endpoint."""
-    # Authenticate user (placeholder - replace with DB lookup)
-    # user = await authenticate_user(form_data.username, form_data.password)
-    
-    if not form_data.username or not form_data.password:
-        raise HTTPException(
-            status_code=400,
-            detail="Username and password are required"
-        )
-    
-    # Create tokens
-    access_token = create_token(
-        {"sub": form_data.username},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-        scope="access"
-    )
-    
-    refresh_token = create_refresh_token(form_data.username)
-    
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        token_type="bearer",
-        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        user={
-            "username": form_data.username,
-            "role": "trader",
-        }
-    )
+    return _dep
 
 
-@app.post("/api/auth/refresh")
-async def refresh_token(token: str):
-    """Refresh token endpoint."""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("type") != "refresh":
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid token type"
-            )
-        
-        username = payload.get("sub")
-        new_access_token = create_token(
-            {"sub": username},
-            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-            scope="access"
-        )
-        
-        return {
-            "access_token": new_access_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        }
-    except JWTError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid refresh token"
-        )
+async def verify_scope(token: str, required_scope: str) -> None:
+    """Verify a raw token carries ``required_scope`` (used by tooling)."""
+    claims = decode_token(token, expected_type="access")
+    scope = str(claims.get("scope") or "")
+    if required_scope not in scope.split():
+        raise HTTPException(status_code=403, detail=f"Requires scope '{required_scope}'")
 
 
-@app.post("/api/auth/logout")
-async def logout(token: str):
-    """Logout endpoint - invalidates token."""
-    # Add token to blacklist in production
-    # token_store[token] = {"blacklisted": True}
-    
-    return {"message": "Successfully logged out"}
+# ── API keys ────────────────────────────────────────────────────────────────
+
+def _configured_api_keys() -> Set[str]:
+    raw = os.getenv("ZERO_API_KEYS") or os.getenv("ZERO_API_KEY") or ""
+    return {k.strip() for k in raw.replace(";", ",").split(",") if k.strip()}
 
 
-@app.get("/api/auth/me")
-async def get_current_user_info(
-    current_user: User = Depends(get_current_user)
-):
-    """Get current user info."""
-    return {
-        "id": current_user.id,
-        "username": current_user.username,
-        "email": current_user.email,
-        "is_active": current_user.is_active,
-        "is_verified": current_user.is_verified,
-        "role": current_user.role,
-        "created_at": current_user.created_at.isoformat(),
-    }
+def verify_api_key(api_key: Optional[str]) -> str:
+    """
+    Constant-time API-key check against ``ZERO_API_KEYS``.
 
-
-@app.post("/api/auth/verify")
-async def verify_token(token: str):
-    """Verify a token."""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return {
-            "valid": True,
-            "payload": payload,
-        }
-    except JWTError as e:
-        return {
-            "valid": False,
-            "error": str(e),
-        }
-
-
-# API Key authentication
-def get_api_key(
-    api_key: str = Depends(APIKeyHeader(name="X-API-Key", auto_error=False))
-):
-    """Get API key from request."""
-    return api_key
-
-
-async def verify_api_key(
-    api_key: Optional[str] = Depends(get_api_key)
-):
-    """Verify API key."""
-    if not api_key or api_key not in valid_api_keys:
+    Returns the matched key's fingerprint (never the key itself) for audit
+    logs. No keys configured means API-key auth is disabled, not open.
+    """
+    configured = _configured_api_keys()
+    if not configured or not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",
         )
-    return api_key
+    for candidate in configured:
+        if secrets.compare_digest(api_key, candidate):
+            return hashlib.sha256(candidate.encode()).hexdigest()[:12]
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API key",
+    )
 
 
-# Protected routes with API key
-@app.get("/api/protected")
-async def protected_route(
-    api_key: str = Depends(verify_api_key)
-):
-    """Example protected route with API key."""
+def authenticate_user_record(user: Any, password: str) -> bool:
+    """Check a password against a DB user row without leaking which part failed."""
+    if user is None:
+        # Burn comparable time so a missing user is not distinguishable.
+        pwd_context.verify(password, pwd_context.hash("timing-equaliser"))
+        return False
+    hashed = getattr(user, "hashed_password", None)
+    if not hashed:
+        return False
+    return verify_password(password, hashed)
+
+
+def token_claims_for(user: Any) -> Dict[str, Any]:
+    """Claims written into an access token for a DB user row."""
+    username = str(getattr(user, "username", "") or "")
     return {
-        "message": "Access granted to protected route",
-        "api_key_scope": valid_api_keys.get(api_key, {}).get("description"),
+        "sub": username,
+        "uid": str(getattr(user, "id", "") or ""),
+        "email": str(getattr(user, "email", "") or username),
+        "role": str(getattr(user, "role", "viewer") or "viewer"),
     }
+
+
+def issue_tokens(user: Any) -> TokenResponse:
+    """Access + refresh pair for a DB user row."""
+    claims = token_claims_for(user)
+    access = create_token(claims, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+                          scope="access", token_type="access")
+    refresh = create_refresh_token(claims["sub"], claims.get("role", "viewer"))
+    return TokenResponse(
+        access_token=access,
+        refresh_token=refresh,
+        token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user={
+            "id": claims.get("uid"),
+            "username": claims["sub"],
+            "email": claims.get("email"),
+            "role": claims.get("role"),
+        },
+    )
+
+
+def refresh_access_token(refresh_token: str) -> Dict[str, Any]:
+    """
+    Exchange a *refresh* token for a new access token.
+
+    A raw username (what the old endpoint accepted) is rejected: refresh is a
+    signed, typed, revocable credential or it does not happen.
+    """
+    claims = decode_token(refresh_token, expected_type="refresh")
+    sub = str(claims.get("sub"))
+    in_force = _refresh_in_force.get(sub)
+    jti = str(claims.get("jti") or "")
+    if in_force and jti and in_force != jti:
+        raise HTTPException(status_code=401, detail="Refresh token superseded")
+    access = create_token(
+        {"sub": sub, "role": claims.get("role", "viewer")},
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        scope="access",
+        token_type="access",
+    )
+    return {
+        "access_token": access,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+__all__ = [
+    "User", "UserCreate", "TokenResponse", "TokenData",
+    "hash_password", "verify_password", "create_token", "create_refresh_token",
+    "decode_token", "revoke_token", "get_user_from_token", "get_current_user",
+    "get_current_active_user", "require_role", "verify_scope", "verify_api_key",
+    "authenticate_user_record", "issue_tokens", "refresh_access_token",
+    "token_claims_for", "ACCESS_TOKEN_EXPIRE_MINUTES", "IS_DEV",
+]

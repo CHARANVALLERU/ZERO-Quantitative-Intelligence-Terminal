@@ -15,7 +15,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Annotated
 from contextlib import asynccontextmanager
 
 # Local imports
@@ -41,6 +41,16 @@ from backend.validation import (
     validate_email
 )
 from backend.logging_config import setup_logging
+from backend.auth import (
+    User as AuthUser,
+    get_current_user,
+    require_role,
+    authenticate_user_record,
+    issue_tokens,
+    refresh_access_token,
+    revoke_token,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
 from backend.portfolio_operations import (
     portfolio_constructor,
     trade_executor,
@@ -53,6 +63,11 @@ from backend.portfolio_operations import (
 # Setup logging
 log_file = setup_logging()
 logger = logging.getLogger("ZERO_API")
+
+# Every /api/v1 route requires a bearer access token; mutations additionally
+# require a trading role. Admin always passes require_role().
+CurrentUser = Annotated[AuthUser, Depends(get_current_user)]
+TraderUser = Annotated[AuthUser, Depends(require_role("trader", "admin"))]
 
 
 @asynccontextmanager
@@ -101,18 +116,30 @@ app = FastAPI(
 )
 
 # Configure middleware
+# NOTE: `allow_origins=["*"]` together with `allow_credentials=True` is both
+# unsafe and rejected by browsers (the wildcard is ignored for credentialed
+# requests). Restrict origins through ZERO_CORS_ORIGINS; credentials are only
+# enabled when an explicit allow-list is configured.
+_cors_raw = (settings.CORS_ORIGINS or "").strip()
+_cors_list = [o.strip() for o in _cors_raw.split(",") if o.strip() and o.strip() != "*"]
+_cors_open = not _cors_list or "*" in _cors_raw
+if _cors_open:
+    logger.warning(
+        "CORS accepts every origin. Set ZERO_CORS_ORIGINS (comma-separated) "
+        "to restrict cross-origin access."
+    )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure properly in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"] if _cors_open else _cors_list,
+    allow_credentials=not _cors_open,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
-
+_allowed_hosts = [h.strip() for h in (os.getenv("ZERO_ALLOWED_HOSTS") or "*").split(",") if h.strip()]
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*"],
+    allowed_hosts=_allowed_hosts or ["*"],
 )
 
 # Configure rate limiting
@@ -121,17 +148,25 @@ configure_rate_limiter(app)
 
 # ==================== Health & Status ====================
 
+def _cache_health() -> str:
+    """Redis ping that never takes the health endpoint down."""
+    try:
+        return "connected" if get_redis_connection().ping() else "disconnected"
+    except Exception:
+        return "disconnected"
+
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint (no auth: used by load balancers and uptime checks)."""
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "version": settings.API_VERSION,
-        "environment": "production",
+        "environment": settings.API_VERSION,
         "services": {
             "database": "connected",
-            "cache": "connected" if get_redis_connection().ping() else "disconnected",
+            "cache": _cache_health(),
             "background_tasks": "running"
         }
     }
@@ -175,6 +210,7 @@ async def system_status():
 @app.get("/api/v1/predictions/{index}")
 async def get_predictions(
     index: str,
+    user: CurrentUser,
     confidence_threshold: Optional[float] = None,
     db = Depends(get_db)
 ):
@@ -229,7 +265,7 @@ async def get_predictions(
 
 
 @app.get("/api/v1/predictions")
-async def get_all_predictions(db = Depends(get_db)):
+async def get_all_predictions(user: CurrentUser, db = Depends(get_db)):
     """Get predictions for all indices."""
     try:
         indices = ["NIFTY 50", "BANKNIFTY", "SENSEX"]
@@ -258,7 +294,7 @@ async def get_all_predictions(db = Depends(get_db)):
 # ==================== Market Data Endpoints ====================
 
 @app.get("/api/v1/live-prices")
-async def get_live_prices(db = Depends(get_db)):
+async def get_live_prices(user: CurrentUser, db = Depends(get_db)):
     """Get live prices for all indices."""
     try:
         # Check cache first
@@ -297,7 +333,7 @@ async def get_live_prices(db = Depends(get_db)):
 
 
 @app.get("/api/v1/prices/{index}")
-async def get_price(index: str, db = Depends(get_db)):
+async def get_price(index: str, user: CurrentUser, db = Depends(get_db)):
     """Get live price for a specific index."""
     try:
         prices = await get_live_prices(db=db)
@@ -321,6 +357,7 @@ async def get_price(index: str, db = Depends(get_db)):
 
 @app.get("/api/v1/news")
 async def get_news(
+    user: CurrentUser,
     limit: int = 20,
     min_impact: Optional[float] = None,
     db = Depends(get_db)
@@ -384,6 +421,7 @@ async def get_news(
 async def create_order(
     order_data: dict,
     request: Request,
+    user: TraderUser,
     db = Depends(get_db)
 ):
     """Create a new order."""
@@ -404,7 +442,7 @@ async def create_order(
         order_id = f"ORD-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
         order = Order(
             id=order_id,
-            user_id="system",  # Will be replaced with authenticated user
+            user_id=user.id,  # never a client-supplied id
             symbol=validation["symbol"],
             side=validation["side"],
             order_type=validation["order_type"],
@@ -443,11 +481,13 @@ async def create_order(
 
 
 @app.get("/api/v1/orders/{order_id}")
-async def get_order(order_id: str, db = Depends(get_db)):
-    """Get order status."""
+async def get_order(order_id: str, user: CurrentUser, db = Depends(get_db)):
+    """Get order status (own orders only; admins see everything)."""
     try:
         order = db.query(Order).filter(Order.id == order_id).first()
         if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if user.role != "admin" and order.user_id != user.id:
             raise HTTPException(status_code=404, detail="Order not found")
         
         return {
@@ -470,13 +510,16 @@ async def get_order(order_id: str, db = Depends(get_db)):
 
 @app.get("/api/v1/orders")
 async def list_orders(
+    user: CurrentUser,
     user_id: Optional[str] = None,
     db = Depends(get_db)
 ):
-    """List orders."""
+    """List orders. Scoped to the caller unless they are an admin."""
     try:
         query = db.query(Order)
-        if user_id:
+        if user.role != "admin":
+            query = query.filter(Order.user_id == user.id)
+        elif user_id:
             query = query.filter(Order.user_id == user_id)
         
         orders = query.order_by(Order.created_at.desc()).limit(100).all()
@@ -507,6 +550,7 @@ async def list_orders(
 async def create_strategy(
     strategy_data: dict,
     request: Request,
+    user: TraderUser,
     db = Depends(get_db)
 ):
     """Create a trading strategy."""
@@ -526,7 +570,7 @@ async def create_strategy(
         strategy_id = f"STRAT-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
         strategy = Strategy(
             id=strategy_id,
-            user_id="system",
+            user_id=user.id,
             name=name[:100],
             symbol=symbol,
             parameters=json.dumps(parameters)
@@ -552,11 +596,13 @@ async def create_strategy(
 
 
 @app.get("/api/v1/strategies/{strategy_id}")
-async def get_strategy(strategy_id: str, db = Depends(get_db)):
-    """Get strategy details."""
+async def get_strategy(strategy_id: str, user: CurrentUser, db = Depends(get_db)):
+    """Get strategy details (own strategies only; admins see everything)."""
     try:
         strategy = db.query(Strategy).filter(Strategy.id == strategy_id).first()
         if not strategy:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        if user.role != "admin" and strategy.user_id != user.id:
             raise HTTPException(status_code=404, detail="Strategy not found")
         
         return {
@@ -577,13 +623,16 @@ async def get_strategy(strategy_id: str, db = Depends(get_db)):
 
 @app.get("/api/v1/strategies")
 async def list_strategies(
+    user: CurrentUser,
     user_id: Optional[str] = None,
     db = Depends(get_db)
 ):
-    """List strategies."""
+    """List strategies. Scoped to the caller unless they are an admin."""
     try:
         query = db.query(Strategy)
-        if user_id:
+        if user.role != "admin":
+            query = query.filter(Strategy.user_id == user.id)
+        elif user_id:
             query = query.filter(Strategy.user_id == user_id)
         
         strategies = query.order_by(Strategy.created_at.desc()).limit(100).all()
@@ -609,100 +658,91 @@ async def list_strategies(
 @app.post("/api/v1/auth/login")
 async def login(
     credentials: dict,
+    request: Request,
     db = Depends(get_db)
 ):
-    """Login endpoint."""
+    """
+    Login endpoint.
+
+    Credentials are checked against the users table with bcrypt. A successful
+    login issues a typed access token (8h) plus a refresh token (7d); neither
+    is derived from user input beyond the verified identity.
+    """
     try:
-        username = credentials.get("username", "")
-        password = credentials.get("password", "")
-        
+        username = str(credentials.get("username", "") or "").strip()
+        password = str(credentials.get("password", "") or "")
+
         if not username or not password:
             raise HTTPException(status_code=400, detail="Username and password required")
-        
-        # Find user (placeholder - implement with proper auth)
-        from backend.auth import verify_password, create_token, create_refresh_token
-        
+
         user = db.query(User).filter(User.username == username).first()
-        if not user or not verify_password(password, user.hashed_password):
+        if not authenticate_user_record(user, password):
+            logger.warning("failed login for %r from %s", username, request.client.host if request.client else "?")
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        
+
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account inactive")
-        
-        # Update last login
+
         user.last_login = datetime.utcnow()
         db.commit()
-        
-        # Create tokens
-        access_token = create_token({"sub": username})
-        refresh_token = create_refresh_token(username)
-        
-        return {
-            "success": True,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer",
-            "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "role": user.role
-            }
-        }
-    
+
+        tokens = issue_tokens(user)
+        return {"success": True, **tokens.model_dump()}
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error logging in: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Authentication failed")
 
 
 @app.post("/api/v1/auth/refresh")
-async def refresh_token(token: str, db = Depends(get_db)):
-    """Refresh access token."""
-    try:
-        from backend.auth import create_token
-        
-        new_token = create_token({"sub": token})
-        
-        return {
-            "success": True,
-            "access_token": new_token,
-            "token_type": "bearer",
-            "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
-        }
-    
-    except Exception as e:
-        logger.error(f"Error refreshing token: {e}")
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+async def refresh_token(payload: dict):
+    """
+    Refresh an access token.
+
+    Requires a signed refresh token in the body (``{"refresh_token": "..."}``).
+    The old version signed a fresh access token for whatever string it was
+    handed, which let anyone mint credentials from a username.
+    """
+    token = ""
+    if isinstance(payload, dict):
+        token = str(payload.get("refresh_token") or payload.get("token") or "")
+    if not token:
+        raise HTTPException(status_code=400, detail="refresh_token required")
+    return refresh_access_token(token)
+
+
+@app.post("/api/v1/auth/logout")
+async def logout(payload: Optional[dict] = None, user: CurrentUser = None):
+    """Revoke the presented token (access and/or refresh)."""
+    revoked = 0
+    for key in ("access_token", "refresh_token", "token"):
+        value = (payload or {}).get(key) if isinstance(payload, dict) else None
+        if value and revoke_token(str(value)):
+            revoked += 1
+    return {"success": True, "revoked": revoked, "user": user.username if user else None}
 
 
 @app.get("/api/v1/auth/me")
-async def get_current_user(db = Depends(get_db)):
-    """Get current authenticated user."""
-    try:
-        # Extract user from token (placeholder)
-        user = {"id": "system", "username": "system", "email": "system@zero.terminal", "role": "admin"}
-        
-        return {
-            "id": user["id"],
-            "username": user["username"],
-            "email": user["email"],
-            "role": user["role"]
-        }
-    
-    except Exception as e:
-        logger.error(f"Error getting current user: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_current_user(user: CurrentUser):
+    """Return the authenticated principal (never a hard-coded admin)."""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+        "is_active": user.is_active,
+    }
 
 
 # ==================== Portfolio & Trade Endpoints ====================
 
 @app.post("/api/v1/portfolio")
 async def create_portfolio(
-    portfolio_data: dict
+    portfolio_data: dict,
+    user: TraderUser
 ):
     """Create a new portfolio."""
     try:
@@ -731,7 +771,7 @@ async def create_portfolio(
 
 
 @app.get("/api/v1/portfolio/{portfolio_id}")
-async def get_portfolio(portfolio_id: str):
+async def get_portfolio(portfolio_id: str, user: CurrentUser):
     """Get portfolio details."""
     try:
         if portfolio_id not in portfolio_constructor.portfolios:
@@ -774,7 +814,8 @@ async def get_portfolio(portfolio_id: str):
 
 @app.post("/api/v1/trade/execute")
 async def execute_trade(
-    trade_data: dict
+    trade_data: dict,
+    user: TraderUser
 ):
     """Execute a trade order."""
     try:
@@ -825,7 +866,8 @@ async def check_compliance(
     symbol: str,
     side: str,
     quantity: float,
-    portfolio_id: str
+    portfolio_id: str,
+    user: CurrentUser
 ):
     """Check if a trade passes compliance rules."""
     try:
@@ -858,7 +900,7 @@ async def check_compliance(
 
 
 @app.get("/api/v1/blotter")
-async def get_trade_blotter():
+async def get_trade_blotter(user: CurrentUser):
     """Get the trade blotter."""
     try:
         return {

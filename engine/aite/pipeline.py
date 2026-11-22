@@ -124,10 +124,17 @@ def ensure_enough_bars(
     bars: int | None = None,
     *,
     frames: Optional[Dict[str, Any]] = None,
+    allow_synthetic: bool = False,
 ) -> Any:
     """
-    Load OHLC with ≥ TARGET_BARS (252). Retries with higher request if short.
-    Never returns a frame below MIN_BARS when synthetic fallback is available.
+    Load real OHLC, retrying once with a longer request when short.
+
+    This function used to fabricate a full synthetic series whenever the vendor
+    came back short, which is how bots were examined (and promoted) on prices
+    that never existed. It now returns the real frame whatever its length and
+    lets the exam reject promotion; synthetic bars require an explicit
+    ``allow_synthetic=True`` (tests/demos) and are tagged, so they can never
+    pass the gate.
     """
     from engine.aite.exam import load_market_frame, _synthetic_ohlcv
 
@@ -138,16 +145,21 @@ def ensure_enough_bars(
 
     df = load_market_frame(symbol, bars=need)
     if len(df) < cfg.MIN_BARS:
-        # Force longer synthetic pad via second load request
         df = load_market_frame(symbol, bars=max(need, cfg.TARGET_BARS * 2))
     if len(df) < cfg.MIN_BARS:
-        df = _synthetic_ohlcv(need, seed=abs(hash(symbol)) % 10_000)
-        log_activity(
-            f"ensure_enough_bars({symbol}): forced synthetic {len(df)} bars",
-            level="WARN",
-            source="pipeline",
-            symbol=symbol,
-        )
+        if allow_synthetic:
+            df = _synthetic_ohlcv(need, seed=abs(hash(symbol)) % 10_000, symbol=symbol)
+            log_activity(
+                f"ensure_enough_bars({symbol}): DEMO synthetic {len(df)} bars "
+                "(cannot pass the exam gate)",
+                level="WARN", source="pipeline", symbol=symbol,
+            )
+        else:
+            log_activity(
+                f"ensure_enough_bars({symbol}): only {len(df)} real bars available - "
+                "promotion will be rejected",
+                level="WARN", source="pipeline", symbol=symbol,
+            )
     if frames is not None:
         frames[symbol] = df
     return df
