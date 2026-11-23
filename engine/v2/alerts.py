@@ -33,10 +33,55 @@ ALERTS_DIR = os.path.join("db", "v2")
 ALERTS_PATH = os.path.join(ALERTS_DIR, "alerts.jsonl")
 DEDUPE_WINDOW_SECONDS = int(os.getenv("ZERO_ALERT_DEDUPE_SECONDS", "3600"))
 TIMEOUT = float(os.getenv("ZERO_ALERT_TIMEOUT", "8"))
+# The audit trail is appended by a loop that runs for weeks: cap it.
+MAX_BYTES = 2 * 1024 * 1024
+MAX_ROWS = 5000
 
 LEVELS = ("INFO", "WARN", "CRITICAL")
 
 _recent: Dict[str, float] = {}
+
+
+def _cap(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def trim_log(path: str = ALERTS_PATH, max_bytes: Optional[int] = None,
+             max_rows: Optional[int] = None) -> int:
+    """Keep the newest ``max_rows`` lines once the file passes ``max_bytes``.
+
+    The size check runs on every append (one ``stat``); the rewrite only happens
+    when the cap is crossed, so the cost is amortised over thousands of rows.
+    Returns the number of lines dropped.
+    """
+    max_bytes = max_bytes if max_bytes is not None else _cap("ZERO_ALERT_MAX_BYTES", MAX_BYTES)
+    max_rows = max_rows if max_rows is not None else _cap("ZERO_ALERT_MAX_ROWS", MAX_ROWS)
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return 0
+    except OSError:
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return 0
+    keep = lines[-max_rows:]
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(keep)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return 0
+    return max(0, len(lines) - len(keep))
 
 
 def _append_log(row: Dict[str, Any]) -> None:
@@ -44,6 +89,7 @@ def _append_log(row: Dict[str, Any]) -> None:
         os.makedirs(ALERTS_DIR, exist_ok=True)
         with open(ALERTS_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, default=str, sort_keys=True) + "\n")
+        trim_log()
     except Exception:
         pass
 

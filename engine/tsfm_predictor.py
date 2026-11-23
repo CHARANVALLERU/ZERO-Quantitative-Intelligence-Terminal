@@ -86,13 +86,22 @@ Optional pip packages (comment into requirements.txt when enabling):
 """
 from __future__ import annotations
 
+import hashlib  # noqa: E402  (the import at the top of the file sits inside the
+                # module docstring's fenced example, so it never executed and
+                # forecast_ohlc raised NameError at the first cache lookup)
 import importlib.util
 import logging
 import os
+import re
 import sys
+import time  # also declared only inside the docstring example at the top
 
 import numpy as np
 import pandas as pd
+
+# Forecast-result cache (referenced by forecast_ohlc).
+_TSFM_FORECAST_CACHE: dict = {}
+_FORECAST_CACHE_TTL = 300  # 5 minutes
 
 
 # ── Env-overridable constants ────────────────────────────────────────────────

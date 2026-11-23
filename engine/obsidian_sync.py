@@ -10,6 +10,78 @@ def get_daily_log_path(date_str: str) -> str:
     """Get the path to today's daily log inside the Obsidian vault."""
     return os.path.join(OBSIDIAN_VAULT_PATH, "01_Daily_Logs", f"{date_str}.md")
 
+GRAPH_START = "<!-- ZERO_GRAPH_START -->"
+GRAPH_END = "<!-- ZERO_GRAPH_END -->"
+GRAPH_EXCLUDE_DIRS = {"Templates", ".obsidian", ".trash"}
+
+
+def _link(rel_path: str) -> str:
+    stem = rel_path[:-3] if rel_path.lower().endswith(".md") else rel_path
+    stem = stem.replace(os.sep, "/")
+    name = os.path.basename(stem)
+    # Folder notes read better as "[[Folder/Index|Folder]]"; plain notes as-is.
+    return f"[[{stem}|{name}]]" if name != "Index" else f"[[{stem}|{os.path.dirname(stem)}]]"
+
+
+def refresh_vault_graph() -> dict:
+    """
+    Rebuild the MOC's managed link block from the notes that actually exist.
+
+    Why this exists: the previous logic only *created* the hub notes once and
+    never linked later folders, so the Obsidian graph slowly filled with orphans
+    (new strategy/architecture/AITE notes had no inbound link). This function is
+    idempotent: it replaces only the text between the ZERO_GRAPH markers, so hand
+    written MOC content is never touched.
+    """
+    root = OBSIDIAN_VAULT_PATH
+    if not os.path.isdir(root):
+        return {"ok": False, "reason": "vault missing"}
+
+    by_folder = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in GRAPH_EXCLUDE_DIRS and not d.startswith(".")]
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == ".":
+            continue
+        rel_dir = rel_dir.replace(os.sep, "/")
+        notes = sorted(f[:-3] for f in filenames
+                       if f.lower().endswith(".md") and f != "Index.md")
+        if notes or os.path.isdir(dirpath):
+            by_folder[rel_dir] = notes
+
+    lines = [GRAPH_START, "", "## 🕸️ Live Graph Index (auto-generated)", "",
+             "_Rebuilt from the files on disk; edit outside these markers._", ""]
+    for folder in sorted(by_folder):
+        lines.append(f"### {folder}")
+        lines.append(f"- {_link(folder + '/Index.md')}")
+        for note in by_folder[folder][:60]:
+            lines.append(f"- {_link(f'{folder}/{note}.md')}")
+        if len(by_folder[folder]) > 60:
+            lines.append(f"- _…{len(by_folder[folder]) - 60} more_")
+        lines.append("")
+    lines.append(GRAPH_END)
+    block = "\n".join(lines)
+
+    moc = os.path.join(root, "00_Index_MOC.md")
+    if os.path.exists(moc):
+        with open(moc, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = "---\ntags: [moc, index]\ntype: index\n---\n\n# ZERO Second Brain — MOC\n"
+
+    if GRAPH_START in text and GRAPH_END in text:
+        pre = text.split(GRAPH_START)[0]
+        post = text.split(GRAPH_END, 1)[1]
+        new_text = pre + block + post
+    else:
+        new_text = text.rstrip() + "\n\n" + block + "\n"
+
+    with open(moc, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    return {"ok": True, "folders": len(by_folder),
+            "notes": sum(len(v) for v in by_folder.values()), "moc": moc}
+
+
 def ensure_vault_structure():
     """Ensure that the Obsidian Vault directory structure and templates exist."""
     dirs = [
@@ -83,6 +155,17 @@ score: 0
 """
         with open(template_path, "w", encoding="utf-8") as f:
             f.write(template_content)
+
+    # Keep the graph fresh: new notes/directories get inbound links every time the
+    # structure is ensured (called by the daily pipeline), so the graph never
+    # drifts into orphan clusters again.
+    try:
+        info = refresh_vault_graph()
+        if info.get("ok"):
+            logger.info("Obsidian graph refreshed: %s folders, %s notes",
+                        info["folders"], info["notes"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Obsidian graph refresh failed: %s", exc)
 
 def parse_markdown_frontmatter(file_content: str) -> dict:
     """Parse YAML frontmatter from markdown file content without external YAML package."""

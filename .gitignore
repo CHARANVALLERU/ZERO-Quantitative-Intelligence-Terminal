@@ -103,3 +103,17 @@ zero_terminal.db
 
 # Generated strategy scratch files (docs + index are kept on purpose)
 strategies/*.tmp
+
+# ── ZERO v2.1 runtime state (regenerated, machine-local) ─────────────────────
+db/v21/
+REPORTS/
+strategies/v21/
+db/options/
+db/pit/
+db/broker/
+db/v2/shadow_*
+db/v2/alerts.jsonl
+db/v2/lab_diagnostics.json
+
+# Chat attachments copied into the workspace
+.cloud-attachments/

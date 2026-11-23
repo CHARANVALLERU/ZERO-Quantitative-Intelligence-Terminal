@@ -35,7 +35,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel
 
 logger = logging.getLogger("ZERO_Auth")
@@ -123,18 +122,45 @@ class TokenData(BaseModel):
 
 # ── Passwords ───────────────────────────────────────────────────────────────
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+# passlib 1.7.4 is broken against bcrypt >= 4.1 (it reads ``bcrypt.__about__``,
+# which was removed) and raises RuntimeError/ValueError on every call. We talk to
+# bcrypt directly instead: same ``$2b$`` hashes, no version coupling, and we
+# truncate to bcrypt's 72-byte limit explicitly rather than letting the backend
+# raise mid-login.
+try:  # pragma: no cover - exercised via the API tests
+    import bcrypt as _bcrypt
+except Exception:  # noqa: BLE001
+    _bcrypt = None
+
+_BCRYPT_ROUNDS = 12
+_DUMMY_HASH: Optional[str] = None
+
+
+def _pw_bytes(password: str) -> bytes:
+    return str(password).encode("utf-8")[:72]
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    if _bcrypt is None:
+        raise RuntimeError("bcrypt is not installed; cannot hash passwords")
+    return _bcrypt.hashpw(_pw_bytes(password), _bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)).decode()
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
+    if _bcrypt is None or not hashed_password:
+        return False
     try:
-        return pwd_context.verify(plain_password, hashed_password)
+        return bool(_bcrypt.checkpw(_pw_bytes(plain_password), str(hashed_password).encode()))
     except Exception:
         return False
+
+
+def _dummy_hash() -> str:
+    """A constant-cost hash used when the username does not exist."""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = hash_password(secrets.token_hex(8))
+    return _DUMMY_HASH
 
 
 # ── Tokens ──────────────────────────────────────────────────────────────────
@@ -352,7 +378,7 @@ def authenticate_user_record(user: Any, password: str) -> bool:
     """Check a password against a DB user row without leaking which part failed."""
     if user is None:
         # Burn comparable time so a missing user is not distinguishable.
-        pwd_context.verify(password, pwd_context.hash("timing-equaliser"))
+        verify_password(password, _dummy_hash())
         return False
     hashed = getattr(user, "hashed_password", None)
     if not hashed:

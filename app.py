@@ -38,6 +38,12 @@ try:
     from ui.v2_panel import render_v2_panel, maybe_render_brief
 except Exception:
     render_v2_panel = None
+
+# ── ZERO v2.1 — suggestions, trading, research, agentic AI, integrations ─────
+try:
+    from ui.v21_panel import render_v21_panel
+except Exception:
+    render_v21_panel = None
     maybe_render_brief = None
 
 # ── Biological Spike Orchestrator (cold-boot console) ────────────────────────
@@ -183,6 +189,16 @@ except Exception:
 try:
     from engine.aite.daemon import start_daemon as _aite_start_daemon
     _aite_start_daemon()
+except Exception:
+    pass
+
+# ── v2.1 ecosystem scheduler — the 24/7 loop behind ecosystem.run_cycle ──────
+# Idempotent (Streamlit re-runs this file on every interaction) and opt-out via
+# ZERO_V21_SCHEDULER=off for tests or a host that runs the CLI loop instead.
+try:
+    from engine.v21.scheduler import enabled as _v21_sched_enabled, start as _v21_sched_start
+    if _v21_sched_enabled():
+        _v21_sched_start()
 except Exception:
     pass
 
@@ -647,7 +663,7 @@ cyber_ff(st.session_state.get('news_feed') or m.get('latest_news'))
 st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
 
 # Primary tab console (AEGIS QUANT appended so existing tab indices stay stable)
-tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5, tab_aegis, tab_spike, tab_v2 = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY", "AEGIS QUANT", "SPIKE CORE", "ZERO ENGINE v2.0"])
+tab1, tab2, tab3, tab6, tab_trading, tab_kronos, tab_aite, tab4, tab5, tab_aegis, tab_spike, tab_v2, tab_v21 = st.tabs(["NIFTY 50", "BANKNIFTY", "SENSEX", "GLOBAL NEWS", "TRADING TERMINAL", "KRONOS ENGINE", "ZERO AITE", "LEARNING LAB", "PREDICTION HISTORY", "AEGIS QUANT", "SPIKE CORE", "ZERO ENGINE v2.0", "ZERO v2.1"])
 
 # UI: remember active tab across auto-refreshes; badge unread breaking items.
 persist_active_tab()
@@ -1671,6 +1687,12 @@ with tab_v2:
         render_v2_panel(m)
     else:
         st.caption("ZERO Engine v2.0 panel unavailable (ui/v2_panel.py failed to import).")
+
+with tab_v21:
+    if render_v21_panel is not None:
+        render_v21_panel()
+    else:
+        st.caption("ZERO v2.1 panel unavailable (ui/v21_panel.py failed to import).")
 
 with tab6:
     _feed = st.session_state.get('news_feed', [])

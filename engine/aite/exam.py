@@ -379,15 +379,37 @@ def _normalize_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
     if rename:
         out = out.rename(columns=rename)
     if not any(c in out.columns for c in ("timestamps", "timestamp", "datetime", "date")):
-        if isinstance(out.index, pd.DatetimeIndex) or str(out.index.name).lower() in (
-            "date", "datetime", "timestamps",
-        ):
+        named_like_date = str(out.index.name).lower() in (
+            "date", "datetime", "timestamps", "time",
+        )
+        if isinstance(out.index, (pd.DatetimeIndex, pd.PeriodIndex)) or named_like_date:
             out = out.reset_index()
-            # reset_index may introduce Date / index / level_0
-            for cand in ("date", "datetime", "index", "level_0"):
+            # reset_index names the column after the index ('Date', 'index', ...).
+            # The old code compared against lower-case names only, so yfinance's
+            # capitalised 'Date' column was silently dropped together with the
+            # index - which is exactly what made real vendor frames fail the
+            # provenance gate as "unverified / no timestamps".
+            out.columns = [str(c).lower() for c in out.columns]
+            for cand in ("date", "datetime", "time", "index", "level_0"):
                 if cand in out.columns:
                     out = out.rename(columns={cand: "timestamps"})
                     break
+        else:
+            # Last resort: a positional index carries no market time. Emit a
+            # `bar_<n>` placeholder so the provenance layer can see it for what
+            # it is instead of trusting the frame blindly.
+            out["timestamps"] = [f"bar_{i}" for i in range(len(out))]
+    elif "timestamps" not in out.columns:
+        for cand in ("timestamp", "datetime", "date", "time"):
+            if cand in out.columns:
+                out = out.rename(columns={cand: "timestamps"})
+                break
+
+    if "timestamps" in out.columns:
+        ts = pd.to_datetime(out["timestamps"], errors="coerce", utc=True)
+        if ts.notna().all():
+            out["timestamps"] = ts.dt.tz_convert(None)
+        out = out.sort_values("timestamps", kind="mergesort")
     for need in ("open", "high", "low", "close"):
         if need not in out.columns:
             return pd.DataFrame()

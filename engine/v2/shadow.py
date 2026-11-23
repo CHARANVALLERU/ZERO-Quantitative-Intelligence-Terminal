@@ -34,9 +34,51 @@ SCORES_PATH = os.path.join(SHADOW_DIR, "shadow_scores.jsonl")
 
 DEFAULT_HORIZON_BARS = 10
 
+# A daily forward record accumulates for as long as the scheduler runs; keep the
+# newest window so the JSONL files and their full read stay bounded.
+MAX_BYTES = 4 * 1024 * 1024
+MAX_ROWS = 20000
+
 
 def _ensure_dir() -> None:
     os.makedirs(SHADOW_DIR, exist_ok=True)
+
+
+def _cap(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def trim_log(path: str, max_bytes: Optional[int] = None,
+             max_rows: Optional[int] = None) -> int:
+    """Rotate-in-place once ``path`` passes the byte cap, keeping the newest rows."""
+    max_bytes = max_bytes if max_bytes is not None else _cap("ZERO_SHADOW_MAX_BYTES", MAX_BYTES)
+    max_rows = max_rows if max_rows is not None else _cap("ZERO_SHADOW_MAX_ROWS", MAX_ROWS)
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return 0
+    except OSError:
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return 0
+    keep = lines[-max_rows:]
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(keep)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return 0
+    return max(0, len(lines) - len(keep))
 
 
 def _append(path: str, row: Dict[str, Any]) -> bool:
@@ -44,6 +86,7 @@ def _append(path: str, row: Dict[str, Any]) -> bool:
         _ensure_dir()
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, default=str, sort_keys=True) + "\n")
+        trim_log(path)
         return True
     except Exception:
         return False

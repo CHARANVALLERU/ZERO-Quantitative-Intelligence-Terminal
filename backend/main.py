@@ -715,12 +715,24 @@ async def refresh_token(payload: dict):
 
 
 @app.post("/api/v1/auth/logout")
-async def logout(payload: Optional[dict] = None, user: CurrentUser = None):
-    """Revoke the presented token (access and/or refresh)."""
+async def logout(request: Request, payload: Optional[dict] = None, user: CurrentUser = None):
+    """
+    Revoke the presented token(s).
+
+    The bearer token is always revoked — logging out without revoking the very
+    token that authenticated the call would be a no-op. Any refresh token sent in
+    the body is revoked as well, so the session cannot be resurrected.
+    """
     revoked = 0
+    bearer = ""
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        bearer = header[7:].strip()
+    if bearer and revoke_token(bearer):
+        revoked += 1
     for key in ("access_token", "refresh_token", "token"):
         value = (payload or {}).get(key) if isinstance(payload, dict) else None
-        if value and revoke_token(str(value)):
+        if value and str(value) != bearer and revoke_token(str(value)):
             revoked += 1
     return {"success": True, "revoked": revoked, "user": user.username if user else None}
 
