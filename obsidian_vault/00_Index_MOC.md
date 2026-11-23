@@ -66,9 +66,6 @@ _Rebuilt from the files on disk; edit outside these markers._
 - [[01_Daily_Logs/2026-07-29|2026-07-29]]
 - [[01_Daily_Logs/2026-07-30|2026-07-30]]
 - [[01_Daily_Logs/2026-08-03|2026-08-03]]
-- [[01_Daily_Logs/2026-08-31|2026-08-31]]
-- [[01_Daily_Logs/2026-09-18|2026-09-18]]
-- [[01_Daily_Logs/2026-11-23|2026-11-23]]
 
 ### 02_Mental_Models
 - [[02_Mental_Models/Index|02_Mental_Models]]
@@ -117,6 +114,7 @@ _Rebuilt from the files on disk; edit outside these markers._
 - [[07_AITE_Logs/2026-11-22|2026-11-22]]
 - [[07_AITE_Logs/2026-11-22-Premarket|2026-11-22-Premarket]]
 - [[07_AITE_Logs/2026-11-23|2026-11-23]]
+- [[07_AITE_Logs/2026-11-23-Premarket|2026-11-23-Premarket]]
 - [[07_AITE_Logs/2099-01-01-Premarket|2099-01-01-Premarket]]
 
 <!-- ZERO_GRAPH_END -->
